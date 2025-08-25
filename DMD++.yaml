@@ -21,7 +21,7 @@ minu_shape:
 - 64
 ndim_feat: 6
 pos_embed: true
-prefix: /path/to/TEST_DATA
+prefix: /localStorage/repos/DMD/datasets/test_data
 tar_shape:
 - 128
 - 128

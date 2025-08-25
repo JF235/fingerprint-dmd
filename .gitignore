@@ -1,3 +1,6 @@
 fptools
 logs
-
+datasets/test_data
+*.pkl
+__pycache__
+.vscode
