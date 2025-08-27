@@ -85,6 +85,8 @@ TEST_DATA/
 │   ├── genuine_pair.txt        # (Optional) File listing genuine query-gallery pairs
 ```
 
+📌 Note: In this code, the minutiae orientation is defined such that **clockwise is the positive direction**.  
+
 ### 📄 Format of `genuine_pair.txt`
 
 Each line in `genuine_pair.txt` defines a genuine matching pair between a query and a gallery image. The file format is as follows:
