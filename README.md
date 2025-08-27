@@ -85,7 +85,12 @@ TEST_DATA/
 │   ├── genuine_pair.txt        # (Optional) File listing genuine query-gallery pairs
 ```
 
-📌 Note: In this code, the minutiae orientation is defined such that **clockwise is the positive direction**.  
+📌 **Note**: In this implementation, the minutiae coordinates and orientation are defined as:
+
+- **x**: horizontal axis, increases to the right  
+- **y**: vertical axis, increases downward (image coordinate system)  
+- **θ**: minutia orientation angle, measured from the x-axis with  
+  **clockwise rotation taken as the positive direction**
 
 ### 📄 Format of `genuine_pair.txt`
 
