@@ -321,7 +321,6 @@ def lsar_score_torchB(S, mnt1, mnt2, min_pair=4, max_pair=12, mu_p=20, tau_p=0.4
     return score
 class Evaluator:
     def __init__(self, params, gpus, is_load=False, is_relax=False, Normalize=False, Binary=False) -> None:
-        # params = self.load_config_file(cfg_path)
         self.update_attrs(params)
         self.gpus = gpus
         self.relax = is_relax

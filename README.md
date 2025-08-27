@@ -85,6 +85,13 @@ TEST_DATA/
 │   ├── genuine_pair.txt        # (Optional) File listing genuine query-gallery pairs
 ```
 
+📌 **Note**: In this implementation, the minutiae coordinates and orientation are defined as:
+
+- **x**: horizontal axis, increases to the right  
+- **y**: vertical axis, increases downward (image coordinate system)  
+- **θ**: minutia orientation angle, measured from the x-axis with  
+  **clockwise rotation taken as the positive direction**
+
 ### 📄 Format of `genuine_pair.txt`
 
 Each line in `genuine_pair.txt` defines a genuine matching pair between a query and a gallery image. The file format is as follows:
