@@ -1,4 +1,7 @@
 import re
+import os
+import argparse
+from tqdm import tqdm
 
 def parse_path(filename, query_regex, query_value, debug=False):
     """
@@ -9,7 +12,7 @@ def parse_path(filename, query_regex, query_value, debug=False):
     """
     match = re.match(query_regex, filename)
     if debug:
-        print(filename, query_regex)
+        print(filename, query_regex, match)
     if match:
         if len(match.groups()) != 1:
             raise ValueError('O regex deve conter exatamente um grupo capturado.')
@@ -22,9 +25,7 @@ def parse_path(filename, query_regex, query_value, debug=False):
             return 'gallery'
     else:
         return None
-import os
-import argparse
-from tqdm import tqdm
+
 
 def convert_minutiae_dummy_header(source_dir, target_dir, dataset_name, query_regex, query_value, debug=False):
     """

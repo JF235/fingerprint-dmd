@@ -20,21 +20,33 @@ $ python convert_mnt.py \
     --query_value 1 \
     --debug
 
+$ python convert_mnt.py \
+    --source_dir /localStorage/data/datasets/SD258/minutiae_verifinger/ \
+    --target_dir test_data \
+    --dataset_name sd258 \
+    --query_regex 'sd258_\d+_\d+-(\d{2})_' \
+    --query_value 00 \
+    --debug
+
+IMPORTANT: Minutiae Format !!!
+
 3. Generate genuine pairs
 
 $ python generate_pairs.py --dataset_dir fvc2002db1a --subject_regex '(\d+)_\d.mnt'
 
 # B. Pickle Setup
 
+Now change directories to root
+
 Generate Pickle file
 
 $ python dump_dataset_mnteval.py --prefix datasets/test_data --dataset_name fvc2002db1a --img_type png
 
+$ python dump_dataset_mnteval.py --prefix datasets/test_data --dataset_name sd258 --img_type png      
+
 Be careful with missing minutiae
 
 # C. Evaluating
-
-Now at change directories to root
 
 $ python evaluate_mnt.py -d sd258 -m DMD++ -sn -e
 
