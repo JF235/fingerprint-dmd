@@ -123,7 +123,7 @@ def get_model(model_path, device = 'cpu'):
 
     return model
 
-def get_embeddings(model, patches, device='cpu'):
+def get_embeddings(model: DMD, patches, device='cpu'):
     model.eval()
     with torch.no_grad():
         patches_tensor = torch.from_numpy(patches).to(device)
@@ -415,7 +415,7 @@ def pad_collate_fn(batch):
     return batch_dict
 
 
-def identify(query_templates, gallery_templates, device='cpu', batch_size=64):
+def identify(query_templates:list[dict], gallery_templates:list[dict], device:str='cpu', batch_size:int=64):
     """
     Realiza a identificação 1:N de forma otimizada, comparando uma lista de templates 
     de busca com uma lista de templates da galeria usando processamento em lote.

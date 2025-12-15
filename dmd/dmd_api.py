@@ -25,3 +25,11 @@ class DmdMatcher:
 
     def identify(self, queries, gallery, device='cpu', batch_size=256):
         return identify(queries, gallery, device, batch_size)
+
+def get_model_path(which="dmd++"):
+    if which == "dmd++":
+        path = '../logs/DMD++/best_model.pth.tar'
+    elif which == "dmd":
+        path = '../logs/DMD/best_model.pth.tar'
+    
+    return path
