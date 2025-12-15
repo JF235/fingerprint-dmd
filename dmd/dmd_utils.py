@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import torch
-from dmd_model import DMD
+from .dmd_model import DMD
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from torch_linear_assignment import batch_linear_assignment
@@ -140,7 +140,6 @@ def get_template(img, mnt, model, device='cpu'):
     embeddings['mnt'] = mnt.to(device)
     return embeddings
 
-from torch_linear_assignment import batch_linear_assignment
 def calculate_score_torchB(feat1, feat2, mask1, mask2, ndim_feat=6, N_mean=1327, Normalize=False, binary=False, f2f_type=(2, 1)):
     '''
     The function to calculate the score between two images or two set images
@@ -304,7 +303,7 @@ def lsar_score_torchB(S, mnt1, mnt2, min_pair=4, max_pair=12, mu_p=20, tau_p=0.4
 
     return final_score, pairs, scores, relaxed_scores, sorted_indices, n_pair
 
-def match(q_tpl, g_tpl):
+def match(q_tpl, g_tpl, details=False):
     search_feat = q_tpl['feature']
     gallery_feat = g_tpl['feature']
     search_mask = q_tpl['mask']
@@ -316,11 +315,19 @@ def match(q_tpl, g_tpl):
     normalize = True
     scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=ndim_feat*2,  Normalize=normalize, N_mean=5, binary=binary, f2f_type=(2,1))
     if relax:
-        score, _, _, _ = lsar_score_torchB(scores, q_tpl['mnt'], g_tpl['mnt'])
+        final_score, pairs, scores, relaxed_scores, sorted_indices, n_pair = lsar_score_torchB(scores, q_tpl['mnt'], g_tpl['mnt'])
     else:
         score = scores
 
-    return score.cpu().numpy()
+    if details:
+        return {"score": final_score.cpu().numpy(),
+                "pairs": pairs.cpu().numpy(),
+                "scores": scores.cpu().numpy(),
+                "relaxed_scores": relaxed_scores.cpu().numpy(),
+                "sorted_indices": sorted_indices.cpu().numpy(),
+                "n_pair": n_pair.cpu().numpy()}
+    else:
+        return final_score.cpu().numpy()
 
 def match_with_details(q_tpl, g_tpl):
     search_feat = q_tpl['feature']

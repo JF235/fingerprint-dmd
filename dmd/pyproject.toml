@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmd"
+version = "0.1.0"
+description = "Dense Minutia Descriptor for Latent Fingerprint Matching"
+authors = [
+    {name = "Zhiyu Pan, Yongjie Duan, Xiongjun Guan, Jianjiang Feng, Jie Zhou"}
+]
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/JF235/fingerprint-dmd"
+
+[tool.setuptools]
+packages = ["dmd"]
+package-dir = {"dmd" = "."}
+py-modules = []
+
+[tool.setuptools.package-data]
+dmd = ["*.py"]
