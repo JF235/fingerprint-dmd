@@ -2,6 +2,7 @@ fptools
 logs
 datasets/test_data
 *.pkl
+*.png
 __pycache__
 .vscode
 *.egg-info

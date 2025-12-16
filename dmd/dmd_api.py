@@ -1,4 +1,4 @@
-from .dmd_utils import get_model, get_template, match, identify
+from .dmd_utils import get_model, get_template, get_templates_batch, match, identify
 
 
 class DmdExtractor:
@@ -12,9 +12,43 @@ class DmdExtractor:
         """
         self.device = device
         self.model = get_model(model_path, device=device)
+        self._warmup()
+
+    def _warmup(self):
+        """Warm up the model with a dummy inference to initialize CUDA kernels."""
+        import torch
+        import numpy as np
+        dummy_img = np.random.randint(0, 255, (512, 512), dtype=np.uint8)
+        dummy_mnt = np.array([[256, 256, 0]], dtype=np.float32)
+        try:
+            with torch.no_grad():
+                _ = self.extract(dummy_img, dummy_mnt)
+        except:
+            pass  # Silently fail if warmup fails
 
     def extract(self, img, mnt):
+        """Extract template from a single image."""
         return get_template(img, mnt, self.model, device=self.device)
+    
+    def extract_batch(self, images, mnts, use_gpu_patches=True, max_batch_size=64):
+        """
+        Extract templates from multiple images in batch mode.
+        
+        Args:
+            images: List of numpy arrays [H, W]
+            mnts: List of minutiae arrays, each [N_i, 3]
+            use_gpu_patches: Use GPU-accelerated patch extraction (default: True)
+            max_batch_size: Maximum batch size for inference (default: 64)
+            
+        Returns:
+            List of template dicts
+        """
+        return get_templates_batch(
+            images, mnts, self.model, 
+            device=self.device,
+            use_gpu_patches=use_gpu_patches,
+            max_batch_size=max_batch_size
+        )
 
 class DmdMatcher:
     def __init__(self):

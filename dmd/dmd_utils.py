@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import torch
+import torch.nn.functional as F
 from .dmd_model import DMD
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
@@ -104,6 +105,103 @@ def extract_patches(img, mnt, patch_size=(128,128), img_ppi=500):
     patches = np.concatenate(patches, axis=0)
     return patches
 
+
+def extract_patches_batch_gpu(images, mnts, patch_size=(128, 128), img_ppi=500, device='cuda'):
+    """
+    GPU-accelerated batch patch extraction using PyTorch.
+    
+    Args:
+        images: List of numpy arrays or single batch tensor [B, H, W]
+        mnts: List of minutiae arrays, each [N_i, 3] (x, y, angle)
+        patch_size: Tuple (height, width) for output patches
+        img_ppi: Image PPI for normalization
+        device: 'cuda' or 'cpu'
+        
+    Returns:
+        patches: Tensor [Total_N, 1, H, W] - all patches concatenated
+        patch_counts: List of patch counts per image
+    """
+    tar_shape = np.array(patch_size)
+    middle_shape = tar_shape.copy()
+    scale = img_ppi * 1.0 / 500 * float(tar_shape[0]) / float(middle_shape[0])
+    
+    # Convert images to tensor if needed
+    if isinstance(images, list):
+        images = [torch.from_numpy(img).float() if isinstance(img, np.ndarray) else img for img in images]
+    
+    all_patches = []
+    patch_counts = []
+    
+    device = torch.device(device)
+    
+    for img, mnt in zip(images, mnts):
+        if mnt is None or len(mnt) == 0:
+            patch_counts.append(0)
+            continue
+            
+        # Move image to GPU
+        if not isinstance(img, torch.Tensor):
+            img = torch.from_numpy(img).float()
+        img = img.to(device)
+        
+        # Normalize image
+        img = (img - 127.5) / 127.5
+        
+        # Convert minutiae to tensor
+        if isinstance(mnt, np.ndarray):
+            mnt = torch.from_numpy(mnt).float()
+        mnt = mnt.to(device)
+        
+        N = len(mnt)
+        patch_counts.append(N)
+        
+        # Create affine transformation matrices for all minutiae
+        # [N, 2, 3] transformation matrices
+        angles_rad = torch.deg2rad(mnt[:, 2])
+        cos_a = torch.cos(angles_rad)
+        sin_a = torch.sin(angles_rad)
+        
+        # Center of output patch
+        center = torch.tensor([tar_shape[1] / 2.0, tar_shape[0] / 2.0], device=device)
+        
+        # Build affine matrices: [cos -sin tx; sin cos ty]
+        theta = torch.zeros(N, 2, 3, device=device)
+        theta[:, 0, 0] = cos_a * scale
+        theta[:, 0, 1] = sin_a * scale
+        theta[:, 1, 0] = -sin_a * scale
+        theta[:, 1, 1] = cos_a * scale
+        
+        # Translation to center the minutiae
+        theta[:, 0, 2] = (center[0] - (mnt[:, 0] * cos_a * scale + mnt[:, 1] * sin_a * scale))
+        theta[:, 1, 2] = (center[1] - (-mnt[:, 0] * sin_a * scale + mnt[:, 1] * cos_a * scale))
+        
+        # Normalize theta for grid_sample (expects [-1, 1] range)
+        theta[:, 0, 2] = 2.0 * theta[:, 0, 2] / tar_shape[1]
+        theta[:, 1, 2] = 2.0 * theta[:, 1, 2] / tar_shape[0]
+        theta[:, 0, :2] = theta[:, 0, :2] * 2.0 / tar_shape[1]
+        theta[:, 1, :2] = theta[:, 1, :2] * 2.0 / tar_shape[0]
+        
+        # Create grid and sample patches
+        grid = F.affine_grid(theta, [N, 1, tar_shape[0], tar_shape[1]], align_corners=False)
+        
+        # Expand image for batch sampling
+        img_batch = img.unsqueeze(0).unsqueeze(0).expand(N, 1, -1, -1)
+        
+        # Sample all patches at once
+        patches = F.grid_sample(img_batch, grid, mode='bilinear', 
+                               padding_mode='border', align_corners=False)
+        
+        all_patches.append(patches)
+    
+    if len(all_patches) == 0:
+        return torch.zeros((0, 1, tar_shape[0], tar_shape[1]), device=device), patch_counts
+    
+    # Concatenate all patches
+    all_patches = torch.cat(all_patches, dim=0)
+    
+    return all_patches, patch_counts
+
+
 def get_model(model_path, device = 'cpu'):
 
     ndim_feat = 6
@@ -127,10 +225,74 @@ def get_embeddings(model: DMD, patches, device='cpu'):
     model.eval()
     with torch.no_grad():
         patches_tensor = torch.from_numpy(patches).to(device)
-        # Add channel dimension
-        patches_tensor = patches_tensor.unsqueeze(1)  # (N, 128, 128) -> (N, 1, 128, 128)
+        if patches_tensor.dim() == 3:
+            patches_tensor = patches_tensor.unsqueeze(1)
+        elif patches_tensor.dim() == 5:
+            patches_tensor = patches_tensor.squeeze(2)
+
+        if patches_tensor.dim() != 4:
+            raise RuntimeError(f"get_embeddings: unexpected patches tensor shape {patches_tensor.shape}")
+
         embeddings = model.get_embedding(patches_tensor) # (N, ndim_feat, 16, 16)
     return embeddings
+
+
+def get_embeddings_batch(model: DMD, patches_tensor, device='cuda', max_batch_size=64):
+    """
+    Process patches in batches to maximize GPU utilization.
+    
+    Args:
+        model: DMD model
+        patches_tensor: Tensor [N, 1, H, W] or numpy array
+        device: Device to use
+        max_batch_size: Maximum batch size for inference
+        
+    Returns:
+        embeddings: Dict with 'feature' and 'mask' tensors
+    """
+    model.eval()
+    
+    # Convert to tensor if needed
+    if isinstance(patches_tensor, np.ndarray):
+        patches_tensor = torch.from_numpy(patches_tensor)
+    
+    # Ensure correct dimensions
+    if patches_tensor.dim() == 3:
+        patches_tensor = patches_tensor.unsqueeze(1)
+    elif patches_tensor.dim() == 5:
+        patches_tensor = patches_tensor.squeeze(2)
+    
+    if patches_tensor.dim() != 4:
+        raise RuntimeError(f"get_embeddings_batch: unexpected shape {patches_tensor.shape}")
+    
+    N = patches_tensor.shape[0]
+    
+    if N == 0:
+        # Return empty embeddings
+        return {
+            'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16), device=device),
+            'mask': torch.zeros((1, 0, 16, 16), device=device)
+        }
+    
+    all_features = []
+    all_masks = []
+    
+    with torch.no_grad():
+        for i in range(0, N, max_batch_size):
+            batch = patches_tensor[i:i+max_batch_size].to(device)
+            embeddings = model.get_embedding(batch)
+            
+            all_features.append(embeddings['feature'].cpu())
+            all_masks.append(embeddings['mask'].cpu())
+    
+    # Concatenate results
+    result = {
+        'feature': torch.cat(all_features, dim=1),  # [1, N, C, H, W]
+        'mask': torch.cat(all_masks, dim=1)  # [1, N, H, W]
+    }
+    
+    return result
+
 
 def get_template(img, mnt, model, device='cpu'):
     patches = extract_patches(img, mnt)
@@ -139,6 +301,84 @@ def get_template(img, mnt, model, device='cpu'):
     mnt = torch.from_numpy(mnt).unsqueeze(0).float()
     embeddings['mnt'] = mnt.to(device)
     return embeddings
+
+
+def get_templates_batch(images, mnts, model, device='cuda', use_gpu_patches=True, max_batch_size=64):
+    """
+    Extract templates from multiple images in batch mode for maximum GPU utilization.
+    
+    Args:
+        images: List of numpy arrays [H, W]
+        mnts: List of minutiae arrays, each [N_i, 3]
+        model: DMD model
+        device: Device to use
+        use_gpu_patches: Use GPU-accelerated patch extraction
+        max_batch_size: Maximum batch size for model inference
+        
+    Returns:
+        templates: List of template dicts, each with 'feature', 'mask', 'mnt'
+    """
+    if len(images) == 0:
+        return []
+    
+    device = torch.device(device)
+    model.to(device)
+    model.eval()
+    
+    # Step 1: Extract all patches (GPU-accelerated if enabled)
+    if use_gpu_patches and device.type == 'cuda':
+        all_patches, patch_counts = extract_patches_batch_gpu(images, mnts, device=device)
+    else:
+        # Fallback to CPU extraction
+        all_patches_list = []
+        patch_counts = []
+        for img, mnt in zip(images, mnts):
+            patches = extract_patches(img, mnt)
+            all_patches_list.append(patches)
+            patch_counts.append(len(patches))
+        
+        if sum(patch_counts) == 0:
+            return [{'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16)),
+                     'mask': torch.zeros((1, 0, 16, 16)),
+                     'mnt': torch.zeros((1, 0, 3))} for _ in range(len(images))]
+        
+        all_patches = np.concatenate(all_patches_list, axis=0)
+        all_patches = torch.from_numpy(all_patches).to(device)
+    
+    # Step 2: Batch inference on all patches at once
+    if all_patches.shape[0] == 0:
+        return [{'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16)),
+                 'mask': torch.zeros((1, 0, 16, 16)),
+                 'mnt': torch.zeros((1, 0, 3))} for _ in range(len(images))]
+    
+    embeddings = get_embeddings_batch(model, all_patches, device=device, max_batch_size=max_batch_size)
+    
+    # Step 3: Split embeddings back to individual templates
+    templates = []
+    start_idx = 0
+    
+    for i, (mnt, count) in enumerate(zip(mnts, patch_counts)):
+        if count == 0:
+            template = {
+                'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16), device=device),
+                'mask': torch.zeros((1, 0, 16, 16), device=device),
+                'mnt': torch.zeros((1, 0, 3), device=device)
+            }
+        else:
+            end_idx = start_idx + count
+            
+            template = {
+                'feature': embeddings['feature'][:, start_idx:end_idx].to(device),
+                'mask': embeddings['mask'][:, start_idx:end_idx].to(device),
+                'mnt': torch.from_numpy(np.array(mnt)).unsqueeze(0).float().to(device)
+            }
+            
+            start_idx = end_idx
+        
+        templates.append(template)
+    
+    return templates
+
 
 def calculate_score_torchB(feat1, feat2, mask1, mask2, ndim_feat=6, N_mean=1327, Normalize=False, binary=False, f2f_type=(2, 1)):
     '''
@@ -455,7 +695,7 @@ def identify(query_templates:list[dict], gallery_templates:list[dict], device:st
         # 3. Calcular scores para o lote inteiro de uma vez
         with torch.no_grad():
             initial_scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=12, Normalize=True)
-            final_scores = lsar_score_torchB(initial_scores, search_mnt, gallery_mnt)
+            final_scores, pairs, scores, relaxed_scores, sorted_indices, n_pair = lsar_score_torchB(initial_scores, search_mnt, gallery_mnt)
         
         # 4. Atribuir os scores do lote à matriz final
         q_indices = index_pairs[:, 0]
