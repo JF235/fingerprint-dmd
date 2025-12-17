@@ -511,9 +511,21 @@ def lsar_score_torchB(S, mnt1, mnt2, min_pair=4, max_pair=12, mu_p=20, tau_p=0.4
         
         return score, lambda_t, sorted_indices, n_pair
     
-    n1 = S.shape[1] 
-    n2 = S.shape[2] 
+    n1 = S.shape[1]
+    n2 = S.shape[2]
     B = S.shape[0]
+
+    # Handle empty templates (0 features): return zero scores
+    if n1 == 0 or n2 == 0:
+        device = S.device
+        final_score = torch.zeros(B, device=device)
+        pairs = torch.zeros((B, 0, 2), dtype=torch.long, device=device)
+        scores = torch.zeros((B, 0), device=device)
+        relaxed_scores = torch.zeros((B, 0), device=device)
+        sorted_indices = torch.zeros((B, 0), dtype=torch.long, device=device)
+        n_pair = torch.zeros(B, dtype=torch.long, device=device)
+        return final_score, pairs, scores, relaxed_scores, sorted_indices, n_pair
+
     assert n1 == mnt1.shape[1] and n2 == mnt2.shape[1]
     S2 = S
     max_n = max(n1, n2)
