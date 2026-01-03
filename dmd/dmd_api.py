@@ -1,5 +1,7 @@
+import os
 from .dmd_utils import get_model, get_template, get_templates_batch, match, identify
 
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class DmdExtractor:
     def __init__(self, model_path, device='cpu'):
@@ -62,8 +64,8 @@ class DmdMatcher:
 
 def get_model_path(which="dmd++"):
     if which == "dmd++":
-        path = '../logs/DMD++/best_model.pth.tar'
+        path = os.path.abspath(os.path.join(_CURRENT_DIR, '../logs/DMD++/best_model.pth.tar'))
     elif which == "dmd":
-        path = '../logs/DMD/best_model.pth.tar'
-    
+        path = os.path.abspath(os.path.join(_CURRENT_DIR, '../logs/DMD/best_model.pth.tar'))
+
     return path

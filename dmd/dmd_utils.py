@@ -1,4 +1,5 @@
 import pickle as pkl
+import os
 import os.path as osp
 import cv2
 import numpy as np
@@ -15,8 +16,9 @@ DATASET = {}
 LOADED_DATASET = ''
 FNAMES = []
 
-IMG_PATH = '../datasets/test_data'
-MODEL_PATH = '../logs/DMD++/best_model.pth.tar'
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+IMG_PATH = os.path.abspath(os.path.join(_CURRENT_DIR, '../datasets/test_data'))
+MODEL_PATH = os.path.abspath(os.path.join(_CURRENT_DIR, '../logs/DMD++/best_model.pth.tar'))
 
 def load_dmd_dataset(dataset_path):
     global DATASET, FNAMES, LOADED_DATASET
