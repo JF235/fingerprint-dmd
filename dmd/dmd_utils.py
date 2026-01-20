@@ -472,46 +472,69 @@ def lsar_score_torchB(S, mnt1, mnt2, min_pair=4, max_pair=12, mu_p=20, tau_p=0.4
         d = torch.sqrt((mnts[:, :, 0, None] - mnts[:, None, :, 0])**2 + (mnts[:, :, 1, None] - mnts[:, None, :, 1])**2)
         return d
     
-    def relax_labeling(mnts1, mnts2, scores, min_number, n_pair): # min_number is the valid number of the mnts for each batch
-        mu_1 = 5
-        mu_2 = torch.pi / 12
-        mu_3 = torch.pi / 12
-        tau_1 = -8.0 / 5
-        tau_2 = -30
-        tau_3 = -30
-        w_R = 1.0 / 2
-        n_rel = 5
+    def relax_labeling(mnts1, mnts2, scores, min_number, n_pair_sig): 
+        # Parâmetros calibrados conforme Tabela 2 do paper [cite: 429]
+        mu_1, tau_1 = 10, -8.0 / 5      # Distância espacial (pixels)
+        mu_2, tau_2 = torch.pi/12, -30 # Diferença direcional
+        mu_3, tau_3 = torch.pi/12, -30 # Ângulo radial
+        w_R = 0.5                      # Peso da relaxação [cite: 352]
+        n_rel = 5                      # Iterações [cite: 429]
 
+        # 1. Cálculo das matrizes de compatibilidade geométrica [cite: 354, 356]
         D1 = torch.abs(distance_mnts(mnts1) - distance_mnts(mnts2))
-        D2 = torch.deg2rad(torch.abs((distance_theta(mnts1[:, :, 2]) - distance_theta(mnts2[:,:, 2])+180) % 360 - 180))
+        D2 = torch.deg2rad(torch.abs((distance_theta(mnts1[:, :, 2]) - distance_theta(mnts2[:,:, 2]) + 180) % 360 - 180))
         D3 = torch.deg2rad(torch.abs((distance_R(mnts1[:, :, :3]) - distance_R(mnts2[:, :, :3]) + 180) % 360 - 180))
-        # Scores iniciais
-        lambda_t = scores
-        rp = (
-            sigmoid(D1, mu_1, tau_1)
-            * sigmoid(D2, mu_2, tau_2)
-            * sigmoid(D3, mu_3, tau_3)
-        )
+
+        # Compatibilidade rho(t,k) [cite: 353]
+        rp = (sigmoid(D1, mu_1, tau_1) * sigmoid(D2, mu_2, tau_2) * sigmoid(D3, mu_3, tau_3))
+        
         B, N, _ = rp.shape
         indices = torch.arange(N)
-        rp[:, indices, indices] = 0
+        rp[:, indices, indices] = 0 # k != t 
         rp = torch.where(torch.isnan(rp), torch.tensor(0.0).to(rp.device), rp)
-        lambda_t = torch.where(torch.isnan(lambda_t), torch.tensor(0.0).to(lambda_t.device), lambda_t)
-        for _ in range(n_rel): 
-            lambda_t = w_R * lambda_t + (1 - w_R) * torch.sum(rp * lambda_t[:,None,:], axis=-1) / (min_number[:,None] - 1)
-        # Scores finais em lambda_t
         
-        efficiency = lambda_t / torch.clamp(scores, min=1e-6)
-        C = efficiency.shape[1]
-        efficiency = torch.where(torch.isnan(efficiency), torch.tensor(-torch.inf).to(efficiency.device), efficiency)
+        lambda_t = torch.where(torch.isnan(scores), torch.tensor(0.0).to(scores.device), scores)
+        scores_init = lambda_t.clone()
+
+        # 2. Processo de Relaxação Iterativo [cite: 348, 362]
+        for _ in range(n_rel): 
+            # Suporte dos vizinhos ponderado pela confiança atual
+            suporte = torch.sum(rp * lambda_t[:, None, :], axis=-1) / (min_number[:, None] - 1)
+            lambda_t = w_R * lambda_t + (1 - w_R) * suporte
+
+        # 3. Cálculo da Eficiência (A chave para eliminar ruído) [cite: 395]
+        # Eficiência = Confiança Final / Confiança Inicial
+        efficiency = lambda_t / torch.clamp(scores_init, min=1e-6)
+        efficiency = torch.where(torch.isnan(efficiency), torch.tensor(0.0).to(efficiency.device), efficiency)
+
+        # 4. Geração da lista de candidatos baseada em ranking de eficiência [cite: 398, 399]
+        # Em vez de ordenar por score, ordenamos por eficiência para garantir geometria
         _, sorted_indices = torch.sort(efficiency, dim=1, descending=True)
         lambda_t_sorted = torch.gather(lambda_t, 1, sorted_indices)
-        k_indices = n_pair.unsqueeze(1) 
-        mask = torch.arange(C).to(k_indices.device).expand(B, C) < k_indices
-        lambda_t_sorted = lambda_t_sorted * mask
-        score = torch.sum(lambda_t_sorted, dim=-1) / n_pair
+        efficiency_sorted = torch.gather(efficiency, 1, sorted_indices)
+
+        # 5. Seleção Dinâmica (Filtro de Qualidade)
+        # Definimos que um par só contribui se a eficiência for alta (ex: > 0.7)
+        # e limitamos ao n_pair da sigmóide para manter estabilidade estatística
+        threshold_eff = (1.01)*(0.5 ** n_rel) 
+        mask_qualidade = (efficiency_sorted > threshold_eff)
+        # print(efficiency_sorted)
         
-        return score, lambda_t, sorted_indices, n_pair
+        # Criamos a máscara para o top N definido pela sigmóide [cite: 339]
+        C = efficiency.shape[1]
+        k_indices = n_pair_sig.unsqueeze(1) 
+        mask_top_n = torch.arange(C).to(k_indices.device).expand(B, C) < k_indices
+        
+        # A máscara final combina o limite de quantidade com o filtro de qualidade
+        final_mask = mask_top_n & mask_qualidade
+        
+        # Contagem real de pares que contribuíram (pode ser menor que n_pair_sig)
+        n_pair_real = torch.clamp(final_mask.sum(dim=-1), min=1)
+        
+        # Score final: média apenas dos pares coerentes
+        score = torch.sum(lambda_t_sorted * final_mask, dim=-1)
+        
+        return score, lambda_t, sorted_indices, n_pair_real.int()
     
     n1 = S.shape[1]
     n2 = S.shape[2]
@@ -622,10 +645,10 @@ class MatchDataset(Dataset):
         gallery_template = self.gallery[gallery_idx]
 
         return {
-            "search_desc": query_template['feature'],
-            "gallery_desc": gallery_template['feature'],
-            "search_mask": query_template['mask'],
-            "gallery_mask": gallery_template['mask'],
+            "search_desc": query_template['feature'].squeeze(0),
+            "gallery_desc": gallery_template['feature'].squeeze(0),
+            "search_mask": query_template['mask'].squeeze(0),
+            "gallery_mask": gallery_template['mask'].squeeze(0),
             "search_mnt": query_template['mnt'].squeeze(0),
             "gallery_mnt": gallery_template['mnt'].squeeze(0),
             "index_pair": torch.tensor([query_idx, gallery_idx])
@@ -634,6 +657,11 @@ class MatchDataset(Dataset):
 # Função para padronizar o tamanho dos tensores em um lote (essencial para batching)
 def pad_collate_fn(batch):
     def pad_to_max_N(tensor_list):
+        # Verifica consistência de dimensões. Se houver mistura de 1D e 2D, promove 1D para (1, D)
+        ndims = {t.ndim for t in tensor_list}
+        if 1 in ndims and 2 in ndims:
+             tensor_list = [t.unsqueeze(0) if t.ndim == 1 else t for t in tensor_list]
+        
         max_N = max(t.shape[0] for t in tensor_list)
         padded_list = []
         for tensor in tensor_list:
