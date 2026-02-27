@@ -590,7 +590,7 @@ def match(q_tpl, g_tpl, details=False):
     relax = True
     binary = False
     normalize = True
-    scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=ndim_feat*2,  Normalize=normalize, N_mean=5, binary=binary, f2f_type=(2,1))
+    scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=ndim_feat*2,  Normalize=normalize, N_mean=1327, binary=binary, f2f_type=(2,1))
     if relax:
         final_score, pairs, scores, relaxed_scores, sorted_indices, n_pair = lsar_score_torchB(scores, q_tpl['mnt'], g_tpl['mnt'])
     else:
@@ -616,7 +616,7 @@ def match_with_details(q_tpl, g_tpl):
     relax = True
     binary = False
     normalize = True
-    scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=ndim_feat*2,  Normalize=normalize, N_mean=5, binary=binary, f2f_type=(2,1))
+    scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=ndim_feat*2,  Normalize=normalize, N_mean=1327, binary=binary, f2f_type=(2,1))
     if relax:
         score, pairs, scores, relaxed_scores, sorted_indices, n_pair = lsar_score_torchB(scores, q_tpl['mnt'], g_tpl['mnt'])
     else:
