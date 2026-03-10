@@ -392,7 +392,7 @@ def calculate_score_torchB(feat1, feat2, mask1, mask2, ndim_feat=6, N_mean=1327,
     feat1_mask = mask1.repeat(1, 1, ndim_feat)
 
     feat2_dense = feat2
-    feat2_mask = mask2.repeat(1, 1, ndim_feat) 
+    feat2_mask = mask2.repeat(1, 1, ndim_feat)
 
     if binary:
         feat1_dense = (feat1_dense > 0).float()
@@ -499,7 +499,7 @@ def lsar_score_torchB(S, mnt1, mnt2, min_pair=4, max_pair=12, mu_p=20, tau_p=0.4
         # 2. Processo de Relaxação Iterativo [cite: 348, 362]
         for _ in range(n_rel): 
             # Suporte dos vizinhos ponderado pela confiança atual
-            suporte = torch.sum(rp * lambda_t[:, None, :], axis=-1) / (min_number[:, None] - 1)
+            suporte = torch.sum(rp * lambda_t[:, None, :], axis=-1) / torch.clamp(min_number[:, None] - 1, min=1)
             lambda_t = w_R * lambda_t + (1 - w_R) * suporte
 
         # 3. Cálculo da Eficiência (A chave para eliminar ruído) [cite: 395]
@@ -645,10 +645,10 @@ class MatchDataset(Dataset):
         gallery_template = self.gallery[gallery_idx]
 
         return {
-            "search_desc": query_template['feature'].squeeze(0),
-            "gallery_desc": gallery_template['feature'].squeeze(0),
-            "search_mask": query_template['mask'].squeeze(0),
-            "gallery_mask": gallery_template['mask'].squeeze(0),
+            "search_desc": query_template['feature'],
+            "gallery_desc": gallery_template['feature'],
+            "search_mask": query_template['mask'],
+            "gallery_mask": gallery_template['mask'],
             "search_mnt": query_template['mnt'].squeeze(0),
             "gallery_mnt": gallery_template['mnt'].squeeze(0),
             "index_pair": torch.tensor([query_idx, gallery_idx])
@@ -685,13 +685,20 @@ def pad_collate_fn(batch):
     index_pairs = [item["index_pair"] for item in batch]
 
     # Aplica o padding
+    _sd = pad_to_max_N(search_desc)
+    _gd = pad_to_max_N(gallery_desc)
+    _sm = pad_to_max_N(search_mask)
+    _gm = pad_to_max_N(gallery_mask)
+    _smnt = pad_to_max_N(search_mnt)
+    _gmnt = pad_to_max_N(gallery_mnt)
+    
     batch_dict = {
-        "search_desc": pad_to_max_N(search_desc),
-        "gallery_desc": pad_to_max_N(gallery_desc),
-        "search_mask": pad_to_max_N(search_mask),
-        "gallery_mask": pad_to_max_N(gallery_mask),
-        "search_mnt": pad_to_max_N(search_mnt),
-        "gallery_mnt": pad_to_max_N(gallery_mnt),
+        "search_desc": _sd,
+        "gallery_desc": _gd,
+        "search_mask": _sm,
+        "gallery_mask": _gm,
+        "search_mnt": _smnt,
+        "gallery_mnt": _gmnt,
         "index_pair": torch.stack(index_pairs)
     }
     return batch_dict
@@ -721,7 +728,6 @@ def identify(query_templates:list[dict], gallery_templates:list[dict], device:st
         num_workers=2,
         pin_memory=True
     )
-
     # 2. Processar em lotes
     print("Iniciando a comparação em lote...")
     for batch in tqdm(match_loader, total=len(match_loader)):
@@ -738,7 +744,7 @@ def identify(query_templates:list[dict], gallery_templates:list[dict], device:st
         with torch.no_grad():
             initial_scores = calculate_score_torchB(search_feat, gallery_feat, search_mask, gallery_mask, ndim_feat=12, Normalize=True)
             final_scores, pairs, scores, relaxed_scores, sorted_indices, n_pair = lsar_score_torchB(initial_scores, search_mnt, gallery_mnt)
-        
+
         # 4. Atribuir os scores do lote à matriz final
         q_indices = index_pairs[:, 0]
         g_indices = index_pairs[:, 1]

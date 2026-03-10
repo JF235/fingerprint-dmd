@@ -4,5 +4,6 @@ datasets/test_data
 *.pkl
 *.png
 __pycache__
+.claude
 .vscode
 *.egg-info

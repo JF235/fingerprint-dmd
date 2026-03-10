@@ -21,10 +21,14 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/JF235/fingerprint-dmd"
 
+[project.scripts]
+dmd = "dmd.cli:main"
+
 [tool.setuptools]
-packages = ["dmd"]
-package-dir = {"dmd" = "."}
+packages = ["dmd", "dmd.commands"]
+package-dir = {"dmd" = ".", "dmd.commands" = "commands"}
 py-modules = []
 
 [tool.setuptools.package-data]
 dmd = ["*.py"]
+"dmd.commands" = ["*.py"]
