@@ -18,6 +18,8 @@ import re
 import sys
 from pathlib import Path
 
+from collections import Counter, defaultdict
+
 import numpy as np
 import torch
 from sklearn.metrics import roc_curve
@@ -98,9 +100,16 @@ def _build_genuine_mask(query_keys, gallery_keys, query_paths, gallery_paths):
     """Return bool array (Q, G). True where identities match and paths differ."""
     Q, G = len(query_keys), len(gallery_keys)
     mask = np.zeros((Q, G), dtype=bool)
+
+    gal_by_key = defaultdict(list)
+    for j, (gk, gp) in enumerate(zip(gallery_keys, gallery_paths)):
+        gal_by_key[gk].append((j, gp))
+
     for i, (qk, qp) in enumerate(zip(query_keys, query_paths)):
-        for j, (gk, gp) in enumerate(zip(gallery_keys, gallery_paths)):
-            mask[i, j] = (qk == gk) and (qp != gp)
+        for j, gp in gal_by_key.get(qk, []):
+            if qp != gp:
+                mask[i, j] = True
+
     return mask
 
 
@@ -189,6 +198,8 @@ def _parse_args(argv):
                    help="Text file with gallery relative paths (one per line)")
     p.add_argument("--distractors",   nargs="*", default=[], metavar="DIR",
                    help="Extra gallery directories (no filter; repeatable)")
+    p.add_argument("--max-distractors", type=int, default=None, metavar="N",
+                   help="Randomly sample at most N distractors (seed=42 for reproducibility)")
     p.add_argument("--output-dir",    required=True,
                    help="Directory where results are saved")
     p.add_argument("--device",        default="cuda",
@@ -219,9 +230,26 @@ def run(argv):
         for f in _collect_templates(dist_root):
             distractor_items.append((f, dist_root))
 
-    print(f"Queries:     {len(query_files)}")
-    print(f"Gallery:     {len(gallery_files)}")
-    print(f"Distractors: {len(distractor_items)}")
+    n_distractors_total = len(distractor_items)
+    if args.max_distractors is not None and n_distractors_total > args.max_distractors:
+        rng = np.random.default_rng(seed=42)
+        idx = rng.choice(n_distractors_total, size=args.max_distractors, replace=False)
+        idx.sort()
+        distractor_items = [distractor_items[i] for i in idx]
+        print(f"Sampled {len(distractor_items)} / {n_distractors_total} distractors (seed=42)")
+    elif args.max_distractors is not None:
+        print(f"--max-distractors {args.max_distractors} >= total {n_distractors_total}, using all.")
+
+    print(f"Queries:     {len(query_files)}  ({query_root})")
+    print(f"Gallery:     {len(gallery_files)}  ({gallery_root})")
+    if distractor_items:
+        dist_counts = Counter(str(root) for _, root in distractor_items)
+        print(f"Distractors: {len(distractor_items)}")
+        for d, c in sorted(dist_counts.items()):
+            print(f"  {c:>6}  {d}")
+    else:
+        print(f"Distractors: 0")
+    print(f"Total gallery: {len(gallery_files) + len(distractor_items)}")
 
     if not query_files:
         print("Error: no query templates found.")
@@ -238,11 +266,14 @@ def run(argv):
     )
 
     # ---- Overlap check -----------------------------------------------
-    overlap = set(query_files) & set(gallery_files)
+    all_gallery_set = set(all_gallery_paths)
+    overlap = set(query_files) & all_gallery_set
     if overlap:
         print(f"Error: {len(overlap)} file(s) appear in both queries and gallery:")
-        for p in sorted(overlap):
+        for p in sorted(overlap)[:10]:
             print(f"  {p}")
+        if len(overlap) > 10:
+            print(f"  ... and {len(overlap) - 10} more")
         sys.exit(1)
 
     # ---- Identity keys -----------------------------------------------
