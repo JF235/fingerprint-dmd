@@ -219,7 +219,7 @@ dmd extract --input-dir DIR --minutiae-dir DIR --output-dir DIR [options]
 | `--device` | | `cuda` | Torch device (`cuda` or `cpu`) |
 | `--filter-regex` | | — | Regex applied to relative image path to filter files |
 | `--filter-list` | | — | Text file with one relative path per line to include |
-| `--overwrite` | | skip | Re-extract even if `.pkl` already exists |
+| `--skip-existing` | | re-extract | Skip images whose `.pkl` already exists |
 
 **Examples:**
 
@@ -237,12 +237,12 @@ dmd extract \
   --output-dir /data/sd27/templates/dmd \
   --filter-regex ".*-latent-.*"
 
-# Force re-extraction on CPU
+# Resume on CPU (only process images still missing their .pkl)
 dmd extract \
   --input-dir  /data/test/images \
   --minutiae-dir /data/test/minutiae \
   --output-dir /data/test/templates/dmd \
-  --device cpu --overwrite
+  --device cpu --skip-existing
 ```
 
 **Output `.pkl` format per file:**

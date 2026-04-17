@@ -93,115 +93,96 @@ def extract_patches(img, mnt, patch_size=(128,128), img_ppi=500):
         patch = (patch - 127.5) / 127.5
         return patch.astype(np.float32)[None]
 
-    # handle empty minutiae
+    # Non-empty path concatenates per-minutia patches of shape (1, H, W) into
+    # (N, H, W); keep the empty case consistent so batched code can concat mixed
+    # empty/non-empty results without shape errors.
     if mnt is None or len(mnt) == 0:
-        return np.zeros((0, 1, int(tar_shape[0]), int(tar_shape[1])), dtype=np.float32)
+        return np.zeros((0, int(tar_shape[0]), int(tar_shape[1])), dtype=np.float32)
 
-    patches = []
-    for pose in mnt:
-        p = _warp_affine_to_patch(img, pose, tar_shape, middle_shape, img_ppi)
-        patches.append(p)
-
-    if len(patches) == 0:
-        return np.zeros((0, 1, int(tar_shape[0]), int(tar_shape[1])), dtype=np.float32)
-    patches = np.concatenate(patches, axis=0)
-    return patches
+    patches = [_warp_affine_to_patch(img, pose, tar_shape, middle_shape, img_ppi) for pose in mnt]
+    return np.concatenate(patches, axis=0)
 
 
 def extract_patches_batch_gpu(images, mnts, patch_size=(128, 128), img_ppi=500, device='cuda'):
     """
-    GPU-accelerated batch patch extraction using PyTorch.
-    
+    GPU-accelerated batch patch extraction. Equivalent to looping extract_patches()
+    over each (image, minutia) pair, up to bilinear-interpolation rounding between
+    cv2.warpAffine and F.grid_sample.
+
     Args:
-        images: List of numpy arrays or single batch tensor [B, H, W]
-        mnts: List of minutiae arrays, each [N_i, 3] (x, y, angle)
-        patch_size: Tuple (height, width) for output patches
-        img_ppi: Image PPI for normalization
+        images: List of numpy arrays or tensors, each [H, W]
+        mnts: List of minutiae arrays, each [N_i, 3] (x, y, angle_deg)
+        patch_size: Tuple (H_dst, W_dst) for output patches
+        img_ppi: Source image PPI; patches are normalized to 500 PPI
         device: 'cuda' or 'cpu'
-        
+
     Returns:
-        patches: Tensor [Total_N, 1, H, W] - all patches concatenated
+        patches: Tensor [Total_N, 1, H_dst, W_dst]
         patch_counts: List of patch counts per image
     """
-    tar_shape = np.array(patch_size)
-    middle_shape = tar_shape.copy()
-    scale = img_ppi * 1.0 / 500 * float(tar_shape[0]) / float(middle_shape[0])
-    
-    # Convert images to tensor if needed
-    if isinstance(images, list):
-        images = [torch.from_numpy(img).float() if isinstance(img, np.ndarray) else img for img in images]
-    
+    H_dst, W_dst = int(patch_size[0]), int(patch_size[1])
+    scale = img_ppi * 1.0 / 500  # middle_shape == tar_shape in extract_patches; ratio is 1
+    inv_s = 1.0 / scale
+    cx, cy = W_dst / 2.0, H_dst / 2.0
+    device = torch.device(device)
+
+    # Base output grid: (v, u) pixel coords of each output cell, shared across minutiae.
+    uu = torch.arange(W_dst, device=device, dtype=torch.float32)
+    vv = torch.arange(H_dst, device=device, dtype=torch.float32)
+    gv, gu = torch.meshgrid(vv, uu, indexing='ij')  # [H_dst, W_dst]
+    du_base = gu - cx
+    dv_base = gv - cy
+
     all_patches = []
     patch_counts = []
-    
-    device = torch.device(device)
-    
+
     for img, mnt in zip(images, mnts):
         if mnt is None or len(mnt) == 0:
             patch_counts.append(0)
             continue
-            
-        # Move image to GPU
+
         if not isinstance(img, torch.Tensor):
-            img = torch.from_numpy(img).float()
-        img = img.to(device)
-        
-        # Normalize image
-        img = (img - 127.5) / 127.5
-        
-        # Convert minutiae to tensor
-        if isinstance(mnt, np.ndarray):
-            mnt = torch.from_numpy(mnt).float()
-        mnt = mnt.to(device)
-        
-        N = len(mnt)
+            img = torch.from_numpy(img)
+        img_t = img.to(device=device, dtype=torch.float32)
+        img_t = (img_t - 127.5) / 127.5
+        H_src, W_src = img_t.shape[-2], img_t.shape[-1]
+
+        if not isinstance(mnt, torch.Tensor):
+            mnt = torch.from_numpy(np.asarray(mnt))
+        mnt_t = mnt.to(device=device, dtype=torch.float32)
+
+        N = mnt_t.shape[0]
         patch_counts.append(N)
-        
-        # Create affine transformation matrices for all minutiae
-        # [N, 2, 3] transformation matrices
-        angles_rad = torch.deg2rad(mnt[:, 2])
-        cos_a = torch.cos(angles_rad)
-        sin_a = torch.sin(angles_rad)
-        
-        # Center of output patch
-        center = torch.tensor([tar_shape[1] / 2.0, tar_shape[0] / 2.0], device=device)
-        
-        # Build affine matrices: [cos -sin tx; sin cos ty]
-        theta = torch.zeros(N, 2, 3, device=device)
-        theta[:, 0, 0] = cos_a * scale
-        theta[:, 0, 1] = sin_a * scale
-        theta[:, 1, 0] = -sin_a * scale
-        theta[:, 1, 1] = cos_a * scale
-        
-        # Translation to center the minutiae
-        theta[:, 0, 2] = (center[0] - (mnt[:, 0] * cos_a * scale + mnt[:, 1] * sin_a * scale))
-        theta[:, 1, 2] = (center[1] - (-mnt[:, 0] * sin_a * scale + mnt[:, 1] * cos_a * scale))
-        
-        # Normalize theta for grid_sample (expects [-1, 1] range)
-        theta[:, 0, 2] = 2.0 * theta[:, 0, 2] / tar_shape[1]
-        theta[:, 1, 2] = 2.0 * theta[:, 1, 2] / tar_shape[0]
-        theta[:, 0, :2] = theta[:, 0, :2] * 2.0 / tar_shape[1]
-        theta[:, 1, :2] = theta[:, 1, :2] * 2.0 / tar_shape[0]
-        
-        # Create grid and sample patches
-        grid = F.affine_grid(theta, [N, 1, tar_shape[0], tar_shape[1]], align_corners=False)
-        
-        # Expand image for batch sampling
-        img_batch = img.unsqueeze(0).unsqueeze(0).expand(N, 1, -1, -1)
-        
-        # Sample all patches at once
-        patches = F.grid_sample(img_batch, grid, mode='bilinear', 
-                               padding_mode='border', align_corners=False)
-        
+
+        px = mnt_t[:, 0].view(N, 1, 1)
+        py = mnt_t[:, 1].view(N, 1, 1)
+        ang = torch.deg2rad(mnt_t[:, 2])
+        cos_a = torch.cos(ang).view(N, 1, 1)
+        sin_a = torch.sin(ang).view(N, 1, 1)
+
+        # Inverse of the cv2.getRotationMatrix2D + recenter affine: for output
+        # pixel (u, v), sample source at:
+        #   x_src = (cos*(u-cx) - sin*(v-cy)) / scale + px
+        #   y_src = (sin*(u-cx) + cos*(v-cy)) / scale + py
+        x_src = inv_s * (cos_a * du_base - sin_a * dv_base) + px  # [N, H_dst, W_dst]
+        y_src = inv_s * (sin_a * du_base + cos_a * dv_base) + py
+
+        # Normalize to grid_sample's [-1, 1] convention (align_corners=False):
+        # x_norm = (2*x + 1) / W_src - 1. MUST use source dims, not patch dims.
+        x_norm = (2.0 * x_src + 1.0) / W_src - 1.0
+        y_norm = (2.0 * y_src + 1.0) / H_src - 1.0
+        grid = torch.stack([x_norm, y_norm], dim=-1)  # [N, H_dst, W_dst, 2]
+
+        img_batch = img_t.unsqueeze(0).unsqueeze(0).expand(N, 1, H_src, W_src)
+        # padding_mode='zeros' matches cv2's borderValue=127.5 after img normalization.
+        patches = F.grid_sample(img_batch, grid, mode='bilinear',
+                                padding_mode='zeros', align_corners=False)
         all_patches.append(patches)
-    
-    if len(all_patches) == 0:
-        return torch.zeros((0, 1, tar_shape[0], tar_shape[1]), device=device), patch_counts
-    
-    # Concatenate all patches
-    all_patches = torch.cat(all_patches, dim=0)
-    
-    return all_patches, patch_counts
+
+    if not all_patches:
+        return torch.zeros((0, 1, H_dst, W_dst), device=device), patch_counts
+
+    return torch.cat(all_patches, dim=0), patch_counts
 
 
 def get_model(model_path, device = 'cpu'):
@@ -268,12 +249,16 @@ def get_embeddings_batch(model: DMD, patches_tensor, device='cuda', max_batch_si
         raise RuntimeError(f"get_embeddings_batch: unexpected shape {patches_tensor.shape}")
     
     N = patches_tensor.shape[0]
-    
+
     if N == 0:
-        # Return empty embeddings
+        # Empty batch: run one dummy patch to discover feature/mask dims,
+        # then drop the row so downstream slicing lines up with (0, feat_dim).
+        dummy = torch.zeros((1, 1, patches_tensor.shape[-2], patches_tensor.shape[-1]), device=device)
+        with torch.no_grad():
+            out = model.get_embedding(dummy)
         return {
-            'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16), device=device),
-            'mask': torch.zeros((1, 0, 16, 16), device=device)
+            'feature': out['feature'][:0].cpu(),
+            'mask':    out['mask'][:0].cpu(),
         }
     
     all_features = []
@@ -287,12 +272,13 @@ def get_embeddings_batch(model: DMD, patches_tensor, device='cuda', max_batch_si
             all_features.append(embeddings['feature'].cpu())
             all_masks.append(embeddings['mask'].cpu())
     
-    # Concatenate results
+    # Concatenate results: model.get_embedding returns (B, feat_dim) after flatten(1),
+    # so the batch dim is 0, not 1.
     result = {
-        'feature': torch.cat(all_features, dim=1),  # [1, N, C, H, W]
-        'mask': torch.cat(all_masks, dim=1)  # [1, N, H, W]
+        'feature': torch.cat(all_features, dim=0),  # (N_total, feat_dim)
+        'mask': torch.cat(all_masks, dim=0)          # (N_total, mask_dim)
     }
-    
+
     return result
 
 
@@ -339,44 +325,31 @@ def get_templates_batch(images, mnts, model, device='cuda', use_gpu_patches=True
             all_patches_list.append(patches)
             patch_counts.append(len(patches))
         
-        if sum(patch_counts) == 0:
-            return [{'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16)),
-                     'mask': torch.zeros((1, 0, 16, 16)),
-                     'mnt': torch.zeros((1, 0, 3))} for _ in range(len(images))]
-        
-        all_patches = np.concatenate(all_patches_list, axis=0)
-        all_patches = torch.from_numpy(all_patches).to(device)
-    
-    # Step 2: Batch inference on all patches at once
-    if all_patches.shape[0] == 0:
-        return [{'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16)),
-                 'mask': torch.zeros((1, 0, 16, 16)),
-                 'mnt': torch.zeros((1, 0, 3))} for _ in range(len(images))]
-    
+        if all_patches_list:
+            all_patches = np.concatenate(all_patches_list, axis=0)
+            all_patches = torch.from_numpy(all_patches).to(device)
+        else:
+            all_patches = torch.zeros((0, 128, 128), device=device)
+
     embeddings = get_embeddings_batch(model, all_patches, device=device, max_batch_size=max_batch_size)
     
-    # Step 3: Split embeddings back to individual templates
+    # Step 3: Split embeddings back to individual templates.
+    # embeddings['feature'] is (N_total, feat_dim); slice rows, not columns.
     templates = []
     start_idx = 0
-    
-    for i, (mnt, count) in enumerate(zip(mnts, patch_counts)):
-        if count == 0:
-            template = {
-                'feature': torch.zeros((1, 0, model.ndim_feat*2, 16, 16), device=device),
-                'mask': torch.zeros((1, 0, 16, 16), device=device),
-                'mnt': torch.zeros((1, 0, 3), device=device)
-            }
-        else:
-            end_idx = start_idx + count
-            
-            template = {
-                'feature': embeddings['feature'][:, start_idx:end_idx].to(device),
-                'mask': embeddings['mask'][:, start_idx:end_idx].to(device),
-                'mnt': torch.from_numpy(np.array(mnt)).unsqueeze(0).float().to(device)
-            }
-            
-            start_idx = end_idx
-        
+
+    for mnt, count in zip(mnts, patch_counts):
+        end_idx = start_idx + count
+        mnt_arr = np.asarray(mnt, dtype=np.float32)
+        if mnt_arr.ndim == 1:
+            mnt_arr = mnt_arr.reshape(0, 3) if mnt_arr.size == 0 else mnt_arr[None]
+        template = {
+            'feature': embeddings['feature'][start_idx:end_idx].to(device),
+            'mask':    embeddings['mask'][start_idx:end_idx].to(device),
+            'mnt':     torch.from_numpy(mnt_arr).unsqueeze(0).to(device),
+        }
+        start_idx = end_idx
+
         templates.append(template)
     
     return templates

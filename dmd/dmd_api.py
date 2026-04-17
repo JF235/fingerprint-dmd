@@ -35,13 +35,14 @@ class DmdExtractor:
     def extract_batch(self, images, mnts, use_gpu_patches=True, max_batch_size=64):
         """
         Extract templates from multiple images in batch mode.
-        
+
         Args:
             images: List of numpy arrays [H, W]
             mnts: List of minutiae arrays, each [N_i, 3]
-            use_gpu_patches: Use GPU-accelerated patch extraction (default: True)
+            use_gpu_patches: Use GPU-accelerated patch extraction (default: True).
+                Matches the CPU path up to bilinear-interpolation rounding.
             max_batch_size: Maximum batch size for inference (default: 64)
-            
+
         Returns:
             List of template dicts
         """

@@ -141,8 +141,10 @@ def _parse_args(argv):
                         help="Text file with one relative path per line to include")
     parser.add_argument("--device",       default="cuda",
                         help="Torch device for inference (default: cuda)")
-    parser.add_argument("--overwrite",    action="store_true",
-                        help="Re-extract even if .pkl already exists (default: skip)")
+    parser.add_argument("--batch-size",  type=int, default=1,
+                        help="Number of images to process per batch (default: 1)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip images whose .pkl already exists (default: re-extract)")
     return parser.parse_args(argv)
 
 
@@ -165,39 +167,82 @@ def run(argv):
     output_path   = Path(args.output_dir)
 
     skipped = errors = 0
+    batch_size = args.batch_size
 
-    for img_path in tqdm(images, desc="Extracting"):
+    # Filter images: skip already-extracted, load minutiae
+    work_items = []  # (img_path, rel_path, out_path, min_path)
+    for img_path in images:
         rel_path = img_path.relative_to(input_path)
         out_path = output_path / rel_path.with_suffix(".pkl")
 
-        if not args.overwrite and out_path.exists():
+        if args.skip_existing and out_path.exists():
             skipped += 1
             continue
 
         min_path = minutiae_path / rel_path.with_suffix(".min")
         if not min_path.exists():
-            tqdm.write(f"Warning: no .min file for {rel_path} (expected {min_path})")
+            print(f"Warning: no .min file for {rel_path} (expected {min_path})")
             errors += 1
             continue
 
-        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            tqdm.write(f"Warning: could not load {img_path}")
-            errors += 1
+        work_items.append((img_path, rel_path, out_path, min_path))
+
+    print(f"To process: {len(work_items)}, Skipped (existing): {skipped}")
+
+    pbar = tqdm(total=len(work_items), desc="Extracting")
+
+    for batch_start in range(0, len(work_items), batch_size):
+        batch = work_items[batch_start:batch_start + batch_size]
+        batch_imgs = []
+        batch_mnts_dmd = []
+        batch_mnts_orig = []
+        batch_meta = []
+
+        for img_path, rel_path, out_path, min_path in batch:
+            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                tqdm.write(f"Warning: could not load {img_path}")
+                errors += 1
+                pbar.update(1)
+                continue
+
+            mnt_for_dmd, mnt_original = load_min_file(min_path)
+            batch_imgs.append(img)
+            batch_mnts_dmd.append(mnt_for_dmd)
+            batch_mnts_orig.append(mnt_original)
+            batch_meta.append(out_path)
+
+        if not batch_imgs:
             continue
 
         try:
-            mnt_for_dmd, mnt_original = load_min_file(min_path)
-            template = extractor.extract(img, mnt_for_dmd)
-            result   = _convert_template(template, mnt_original)
+            if len(batch_imgs) == 1:
+                templates = [extractor.extract(batch_imgs[0], batch_mnts_dmd[0])]
+            else:
+                templates = extractor.extract_batch(
+                    batch_imgs, batch_mnts_dmd, max_batch_size=64,
+                )
+        except Exception as e:
+            tqdm.write(f"Batch failed ({e}); retrying images individually")
+            templates = []
+            for img, mnt in zip(batch_imgs, batch_mnts_dmd):
+                try:
+                    templates.append(extractor.extract(img, mnt))
+                except Exception as e2:
+                    tqdm.write(f"Error on image: {e2}")
+                    templates.append(None)
 
+        for tmpl, mnt_orig, out_path in zip(templates, batch_mnts_orig, batch_meta):
+            if tmpl is None:
+                errors += 1
+                pbar.update(1)
+                continue
+            result = _convert_template(tmpl, mnt_orig)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "wb") as f:
                 pickle.dump(result, f)
+            pbar.update(1)
 
-        except Exception as e:
-            tqdm.write(f"Error on {rel_path}: {e}")
-            errors += 1
-
-    processed = len(images) - skipped - errors
+    pbar.close()
+    processed = len(work_items) - errors
     print(f"Done! Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
