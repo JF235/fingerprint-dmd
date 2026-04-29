@@ -68,7 +68,7 @@ def _identity_key(pkl_path, root_dir):
 # Template reconstruction
 # ---------------------------------------------------------------------------
 
-def _pkl_to_dmd_template(data):
+def _pkl_to_dmd_template(data, min_quality=0):
     """Reconstruct a DMD-compatible template dict from the standard .pkl format.
 
     .pkl stores:
@@ -76,15 +76,29 @@ def _pkl_to_dmd_template(data):
         mask       (N, 768) — expanded mask (repeat×12); recover with [:, ::12]
         minutiae   (N, 4)   — [x, y, angle_ccw, quality] in .min convention
 
+    Args:
+        data:        loaded .pkl dict
+        min_quality: drop minutiae (and matching embeddings/mask rows) with quality < N
+
     DMD matcher expects:
         feature (N, 768)  — direct
         mask    (N, 64)   — original foreground mask
         mnt     (1, N, 3) — [x, y, angle_cw] (clockwise, for lsar_score_torchB)
     """
-    feature = torch.from_numpy(data["embeddings"]).float()       # (N, 768)
-    mask    = torch.from_numpy(data["mask"][:, ::12]).float()    # (N, 64)
+    embeddings = data["embeddings"]
+    mask_arr   = data["mask"]
+    minutiae   = data["minutiae"]
 
-    minutiae  = data["minutiae"].astype(np.float32)              # (N, 4)
+    if min_quality > 0 and len(minutiae) > 0:
+        keep = minutiae[:, 3] >= min_quality
+        embeddings = embeddings[keep]
+        mask_arr   = mask_arr[keep]
+        minutiae   = minutiae[keep]
+
+    feature = torch.from_numpy(embeddings).float()              # (N, 768)
+    mask    = torch.from_numpy(mask_arr[:, ::12]).float()       # (N, 64)
+
+    minutiae  = minutiae.astype(np.float32)                     # (N, 4)
     angle_cw  = (360.0 - minutiae[:, 2]) % 360.0                # CCW → CW
     mnt_arr   = np.column_stack([minutiae[:, 0], minutiae[:, 1], angle_cw])
     mnt       = torch.from_numpy(mnt_arr).float().unsqueeze(0)  # (1, N, 3)
@@ -147,13 +161,15 @@ def _compute_cmc(scores, genuine_mask, max_rank=20):
     return cmc, n_valid
 
 
-def _compute_verification(scores, genuine_mask):
-    """Compute ROC curve, EER, and TAR@FAR.
+def _compute_verification(scores, genuine_mask, threshold_targets=(0.0001, 0.001, 0.01)):
+    """Compute ROC curve, EER, TAR@FAR, and operating thresholds.
 
     Returns:
         fpr, tpr, thresholds : from sklearn.metrics.roc_curve
         eer                  : float
-        tar_at_far           : dict {0.001: float, 0.01: float}
+        threshold_eer        : float — threshold at the EER operating point
+        tar_at_far           : dict {far: tar}
+        threshold_at_far     : dict {far: threshold} — threshold producing FAR ≤ target
     """
     genuine_scores  = scores[genuine_mask]
     impostor_scores = scores[~genuine_mask]
@@ -164,15 +180,66 @@ def _compute_verification(scores, genuine_mask):
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
     fnr = 1.0 - tpr
 
-    eer_idx = int(np.argmin(np.abs(fpr - fnr)))
-    eer     = float((fpr[eer_idx] + fnr[eer_idx]) / 2.0)
+    eer_idx       = int(np.argmin(np.abs(fpr - fnr)))
+    eer           = float((fpr[eer_idx] + fnr[eer_idx]) / 2.0)
+    threshold_eer = float(thresholds[eer_idx])
 
     def _tar_at_far(target):
         valid = fpr <= target
-        return float(tpr[valid][-1]) if valid.any() else 0.0
+        if not valid.any():
+            return 0.0, float("nan")
+        idx = int(np.where(valid)[0][-1])
+        return float(tpr[idx]), float(thresholds[idx])
 
-    tar_at_far = {0.001: _tar_at_far(0.001), 0.01: _tar_at_far(0.01)}
-    return fpr, tpr, thresholds, eer, tar_at_far
+    tar_at_far       = {}
+    threshold_at_far = {}
+    for tgt in threshold_targets:
+        tar, thr = _tar_at_far(tgt)
+        tar_at_far[tgt]       = tar
+        threshold_at_far[tgt] = thr
+
+    return fpr, tpr, thresholds, eer, threshold_eer, tar_at_far, threshold_at_far
+
+
+def _score_stats(scores):
+    """Return mean/std/min/max/p50/p95 for an array of scores."""
+    if len(scores) == 0:
+        return {k: float("nan") for k in ("mean", "std", "min", "max", "p50", "p95")}
+    return {
+        "mean": float(np.mean(scores)),
+        "std":  float(np.std(scores)),
+        "min":  float(np.min(scores)),
+        "max":  float(np.max(scores)),
+        "p50":  float(np.percentile(scores, 50)),
+        "p95":  float(np.percentile(scores, 95)),
+    }
+
+
+def _load_custom_genuine_csv(csv_path, query_paths, gallery_paths, query_root, gallery_root):
+    """Build genuine mask from a CSV with columns (query_rel_path, gallery_rel_path, is_genuine).
+
+    Paths in the CSV are interpreted relative to the queries/gallery roots.
+    Pairs not listed default to False.
+    """
+    Q, G = len(query_paths), len(gallery_paths)
+    mask = np.zeros((Q, G), dtype=bool)
+
+    q_index = {str(p.relative_to(query_root)): i for i, p in enumerate(query_paths)}
+    g_index = {str(p.relative_to(gallery_root)): j for j, p in enumerate(gallery_paths)}
+
+    with open(csv_path) as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        for row in reader:
+            if len(row) < 3:
+                continue
+            q_key, g_key, is_gen = row[0].strip(), row[1].strip(), row[2].strip()
+            if q_key not in q_index or g_key not in g_index:
+                continue
+            if is_gen.lower() in ("1", "true", "yes", "y", "t"):
+                mask[q_index[q_key], g_index[g_key]] = True
+
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -208,37 +275,75 @@ def _parse_args(argv):
                    help="Batch size for identify() (default: 256)")
     p.add_argument("--skip-matching", action="store_true",
                    help="Skip score computation; load scores.npy from --output-dir")
+    p.add_argument("--min-quality",   type=int, default=0,
+                   help="Drop minutiae with quality < N when loading templates (default: 0)")
+    p.add_argument("--genuine-mask-mode", choices=["auto", "fvc_loo", "custom_csv"], default="auto",
+                   help="Genuine mask construction: auto (from filename), fvc_loo (silence multi-genuine warning), custom_csv (read --genuine-mask-csv)")
+    p.add_argument("--genuine-mask-csv", default=None,
+                   help="CSV with columns (query_rel_path, gallery_rel_path, is_genuine); used when --genuine-mask-mode=custom_csv")
+    p.add_argument("--threshold-targets", default="0.0001,0.001,0.01",
+                   help="Comma-separated FAR targets for threshold reporting (default: 0.0001,0.001,0.01)")
     return p.parse_args(argv)
 
 
-def run(argv):
-    args   = _parse_args(argv)
-    device = args.device if torch.cuda.is_available() else "cpu"
-    out    = Path(args.output_dir)
+def _load_template(pkl_path, min_quality=0):
+    with open(pkl_path, "rb") as fh:
+        data = pickle.load(fh)
+    return _pkl_to_dmd_template(data, min_quality=min_quality)
+
+
+class MatchError(Exception):
+    """Raised by match_dataset() for caller-facing errors (no templates, overlap, etc.)."""
+
+
+def match_dataset(
+    queries_dir,
+    gallery_dir,
+    output_dir,
+    *,
+    query_regex=None,
+    query_list=None,
+    gallery_regex=None,
+    gallery_list=None,
+    distractors=(),
+    max_distractors=None,
+    device="cuda",
+    batch_size=256,
+    skip_matching=False,
+    min_quality=0,
+    genuine_mask_mode="auto",
+    genuine_mask_csv=None,
+    threshold_targets=(0.0001, 0.001, 0.01),
+):
+    """Run an identification/verification experiment programmatically.
+
+    Raises MatchError on caller-facing failures. Returns the metrics dict.
+    """
+    device = device if torch.cuda.is_available() else "cpu"
+    out    = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # ---- Collect files -----------------------------------------------
-    query_root   = Path(args.queries_dir)
-    gallery_root = Path(args.gallery_dir)
+    query_root   = Path(queries_dir)
+    gallery_root = Path(gallery_dir)
 
-    query_files   = _collect_templates(query_root,   args.query_regex,   args.query_list)
-    gallery_files = _collect_templates(gallery_root, args.gallery_regex, args.gallery_list)
+    query_files   = _collect_templates(query_root,   query_regex,   query_list)
+    gallery_files = _collect_templates(gallery_root, gallery_regex, gallery_list)
 
     distractor_items = []
-    for dist_dir in args.distractors:
+    for dist_dir in distractors:
         dist_root = Path(dist_dir)
         for f in _collect_templates(dist_root):
             distractor_items.append((f, dist_root))
 
     n_distractors_total = len(distractor_items)
-    if args.max_distractors is not None and n_distractors_total > args.max_distractors:
+    if max_distractors is not None and n_distractors_total > max_distractors:
         rng = np.random.default_rng(seed=42)
-        idx = rng.choice(n_distractors_total, size=args.max_distractors, replace=False)
+        idx = rng.choice(n_distractors_total, size=max_distractors, replace=False)
         idx.sort()
         distractor_items = [distractor_items[i] for i in idx]
         print(f"Sampled {len(distractor_items)} / {n_distractors_total} distractors (seed=42)")
-    elif args.max_distractors is not None:
-        print(f"--max-distractors {args.max_distractors} >= total {n_distractors_total}, using all.")
+    elif max_distractors is not None:
+        print(f"max_distractors {max_distractors} >= total {n_distractors_total}, using all.")
 
     print(f"Queries:     {len(query_files)}  ({query_root})")
     print(f"Gallery:     {len(gallery_files)}  ({gallery_root})")
@@ -252,52 +357,55 @@ def run(argv):
     print(f"Total gallery: {len(gallery_files) + len(distractor_items)}")
 
     if not query_files:
-        print("Error: no query templates found.")
-        sys.exit(1)
+        raise MatchError(f"no query templates found under {query_root}")
     if not gallery_files and not distractor_items:
-        print("Error: no gallery templates found.")
-        sys.exit(1)
+        raise MatchError(f"no gallery templates found under {gallery_root}")
 
-    # ---- Full gallery (primary + distractors) ------------------------
     all_gallery_paths = gallery_files + [f for f, _ in distractor_items]
     all_gallery_roots = (
         [gallery_root] * len(gallery_files)
         + [root for _, root in distractor_items]
     )
 
-    # ---- Overlap check -----------------------------------------------
-    all_gallery_set = set(all_gallery_paths)
-    overlap = set(query_files) & all_gallery_set
+    overlap = set(query_files) & set(all_gallery_paths)
     if overlap:
-        print(f"Error: {len(overlap)} file(s) appear in both queries and gallery:")
-        for p in sorted(overlap)[:10]:
-            print(f"  {p}")
-        if len(overlap) > 10:
-            print(f"  ... and {len(overlap) - 10} more")
-        sys.exit(1)
+        sample = sorted(overlap)[:10]
+        more = f" ... and {len(overlap) - 10} more" if len(overlap) > 10 else ""
+        raise MatchError(f"{len(overlap)} file(s) appear in both queries and gallery: {sample}{more}")
 
-    # ---- Identity keys -----------------------------------------------
     query_keys   = [_identity_key(f, query_root) for f in query_files]
     gallery_keys = [
         _identity_key(f, root)
         for f, root in zip(all_gallery_paths, all_gallery_roots)
     ]
 
-    # ---- Genuine mask ------------------------------------------------
-    print("Building genuine mask...")
-    genuine_mask = _build_genuine_mask(query_keys, gallery_keys, query_files, all_gallery_paths)
+    print(f"Building genuine mask (mode={genuine_mask_mode})...")
+    if genuine_mask_mode == "custom_csv":
+        if not genuine_mask_csv:
+            raise MatchError("genuine_mask_mode=custom_csv requires genuine_mask_csv")
+        if distractor_items:
+            raise MatchError("genuine_mask_mode=custom_csv is not compatible with distractors")
+        genuine_mask = _load_custom_genuine_csv(
+            genuine_mask_csv, query_files, all_gallery_paths,
+            query_root, gallery_root,
+        )
+    else:
+        genuine_mask = _build_genuine_mask(query_keys, gallery_keys, query_files, all_gallery_paths)
 
     multi = [
         (query_files[i], [all_gallery_paths[j] for j in np.where(genuine_mask[i])[0]])
         for i in range(len(query_files))
         if genuine_mask[i].sum() > 1
     ]
-    if multi:
+    if multi and genuine_mask_mode != "fvc_loo":
         print(f"Warning: {len(multi)} query(ies) have multiple genuine gallery matches:")
         for q, gs in multi:
             print(f"  Query: {q.relative_to(query_root)}")
             for g in gs:
                 print(f"    → {g}")
+    elif multi:
+        avg = float(np.mean(genuine_mask.sum(axis=1)))
+        print(f"FVC-LOO mode: avg genuine matches per query = {avg:.2f}")
 
     no_genuine = int((~np.any(genuine_mask, axis=1)).sum())
     if no_genuine:
@@ -305,41 +413,41 @@ def run(argv):
 
     Q = len(query_files)
     G = len(all_gallery_paths)
-
-    # ---- Score matrix ------------------------------------------------
     scores_path = out / "scores.npy"
 
-    if args.skip_matching:
+    if skip_matching:
         if not scores_path.exists():
-            print(f"Error: --skip-matching requested but {scores_path} not found.")
-            sys.exit(1)
+            raise MatchError(f"skip_matching requested but {scores_path} not found")
         print(f"Loading pre-computed scores from {scores_path}")
         scores = np.load(scores_path)
         if scores.shape != (Q, G):
-            print(f"Error: loaded scores shape {scores.shape} != expected ({Q}, {G}).")
-            sys.exit(1)
+            raise MatchError(f"loaded scores shape {scores.shape} != expected ({Q}, {G})")
     else:
-        print("Loading templates...")
+        print(f"Loading templates (min_quality={min_quality})...")
+        # When queries and gallery point to the same files (FVC LOO), load once.
+        same_set = query_files == all_gallery_paths
         query_templates = [
-            _pkl_to_dmd_template(pickle.load(open(f, "rb")))
+            _load_template(f, min_quality=min_quality)
             for f in tqdm(query_files, desc="  Queries")
         ]
-        gallery_templates = [
-            _pkl_to_dmd_template(pickle.load(open(f, "rb")))
-            for f in tqdm(all_gallery_paths, desc="  Gallery")
-        ]
+        if same_set:
+            gallery_templates = query_templates
+        else:
+            gallery_templates = [
+                _load_template(f, min_quality=min_quality)
+                for f in tqdm(all_gallery_paths, desc="  Gallery")
+            ]
 
         print("Computing score matrix...")
         matcher = dmd.DmdMatcher()
         scores  = matcher.identify(
             query_templates, gallery_templates,
-            device=device, batch_size=args.batch_size,
+            device=device, batch_size=batch_size,
         )
 
         np.save(scores_path, scores.astype(np.float32))
         print(f"  Saved → {scores_path}")
 
-    # ---- Save index CSVs and genuine mask ----------------------------
     with open(out / "query_index.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["i", "dataset_alias", "subject_id", "path"])
@@ -354,7 +462,6 @@ def run(argv):
 
     np.save(out / "genuine_mask.npy", genuine_mask)
 
-    # ---- CMC ---------------------------------------------------------
     print("Computing identification metrics (CMC)...")
     cmc, n_valid = _compute_cmc(scores, genuine_mask, max_rank=20)
 
@@ -364,9 +471,10 @@ def run(argv):
         for k, v in enumerate(cmc, 1):
             w.writerow([k, round(float(v), 6)])
 
-    # ---- ROC ---------------------------------------------------------
     print("Computing verification metrics (ROC)...")
-    fpr, tpr, thresholds, eer, tar_at_far = _compute_verification(scores, genuine_mask)
+    threshold_targets = tuple(threshold_targets)
+    (fpr, tpr, thresholds, eer, threshold_eer,
+     tar_at_far, threshold_at_far) = _compute_verification(scores, genuine_mask, threshold_targets)
 
     with open(out / "roc.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -375,37 +483,71 @@ def run(argv):
         for fp, tp, th in zip(fpr[1:], tpr[1:], thresholds):
             w.writerow([round(float(fp), 8), round(float(tp), 8), round(float(th), 8)])
 
-    # ---- metrics.json ------------------------------------------------
+    genuine_scores  = scores[genuine_mask]
+    impostor_scores = scores[~genuine_mask]
+    np.save(out / "genuine_scores.npy",  genuine_scores.astype(np.float32))
+    np.save(out / "impostor_scores.npy", impostor_scores.astype(np.float32))
+
     metrics = {
-        "n_queries":          Q,
-        "n_gallery":          G,
-        "n_gallery_primary":  len(gallery_files),
-        "n_distractors":      len(distractor_items),
-        "n_valid_queries":    n_valid,
-        "rank1":              round(float(cmc[0]),       4),
-        "rank5":              round(float(cmc[4]),       4) if len(cmc) >= 5  else None,
-        "rank10":             round(float(cmc[9]),       4) if len(cmc) >= 10 else None,
-        "eer":                round(eer,                 4),
-        "tar_at_far_0.1pct":  round(tar_at_far[0.001],  4),
-        "tar_at_far_1.0pct":  round(tar_at_far[0.01],   4),
+        "n_queries":         Q,
+        "n_gallery":         G,
+        "n_gallery_primary": len(gallery_files),
+        "n_distractors":     len(distractor_items),
+        "n_valid_queries":   n_valid,
+        "n_genuine_pairs":   int(genuine_mask.sum()),
+        "n_impostor_pairs":  int((~genuine_mask).sum()),
+        "min_quality":       min_quality,
+        "genuine_mask_mode": genuine_mask_mode,
+        "rank1":             round(float(cmc[0]), 4),
+        "rank5":             round(float(cmc[4]), 4) if len(cmc) >= 5  else None,
+        "rank10":            round(float(cmc[9]), 4) if len(cmc) >= 10 else None,
+        "eer":               round(eer, 6),
+        "threshold_eer":     round(threshold_eer, 6),
+        "tar_at_far":        {f"{k:g}": round(v, 6) for k, v in tar_at_far.items()},
+        "threshold_at_far":  {f"{k:g}": round(v, 6) for k, v in threshold_at_far.items()},
+        "score_stats": {
+            "genuine":  _score_stats(genuine_scores),
+            "impostor": _score_stats(impostor_scores),
+        },
     }
     with open(out / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # ---- Summary -----------------------------------------------------
     print()
     print("=" * 40)
     print(f"Queries      : {Q}")
     print(f"Gallery      : {G}  ({len(gallery_files)} primary + {len(distractor_items)} distractors)")
     print(f"Valid queries: {n_valid}")
+    print(f"Genuine pairs: {metrics['n_genuine_pairs']}  Impostor pairs: {metrics['n_impostor_pairs']}")
     print("-" * 40)
-    print(f"Rank-1       : {cmc[0]:.4f}")
+    print(f"Rank-1        : {cmc[0]:.4f}")
     if len(cmc) >= 5:
-        print(f"Rank-5       : {cmc[4]:.4f}")
+        print(f"Rank-5        : {cmc[4]:.4f}")
     if len(cmc) >= 10:
-        print(f"Rank-10      : {cmc[9]:.4f}")
-    print(f"EER          : {eer:.4f}")
-    print(f"TAR@FAR=0.1% : {tar_at_far[0.001]:.4f}")
-    print(f"TAR@FAR=1.0% : {tar_at_far[0.01]:.4f}")
+        print(f"Rank-10       : {cmc[9]:.4f}")
+    print(f"EER           : {eer:.4f}  (threshold={threshold_eer:.4f})")
+    for tgt in threshold_targets:
+        print(f"TAR@FAR={tgt:<7g}: {tar_at_far[tgt]:.4f}  (threshold={threshold_at_far[tgt]:.4f})")
     print("=" * 40)
     print(f"Results → {out}")
+    return metrics
+
+
+def run(argv):
+    args = _parse_args(argv)
+    threshold_targets = tuple(float(x) for x in args.threshold_targets.split(",") if x.strip())
+    try:
+        match_dataset(
+            args.queries_dir, args.gallery_dir, args.output_dir,
+            query_regex=args.query_regex, query_list=args.query_list,
+            gallery_regex=args.gallery_regex, gallery_list=args.gallery_list,
+            distractors=args.distractors, max_distractors=args.max_distractors,
+            device=args.device, batch_size=args.batch_size,
+            skip_matching=args.skip_matching, min_quality=args.min_quality,
+            genuine_mask_mode=args.genuine_mask_mode,
+            genuine_mask_csv=args.genuine_mask_csv,
+            threshold_targets=threshold_targets,
+        )
+    except MatchError as e:
+        print(f"Error: {e}")
+        sys.exit(1)

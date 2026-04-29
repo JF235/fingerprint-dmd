@@ -1,0 +1,78 @@
+# DMD experiments — IJCB 2026
+#
+# Used by:  dmd experiment {extract,match,full} --config experiments_config.yaml
+#
+# Paths under each dataset are resolved relative to `storage_root`.
+# Templates are written to/read from `{storage_root}/{dataset.templates_dir}/{extractor}/...`,
+# mirroring the hierarchy of `images_dir`.
+
+storage_root: /storage/jcontreras/data
+output_root:  /storage/jcontreras/data/experiments/ijcb2026/dmd-match
+
+datasets:
+  sd258:
+    images_dir:    datasets/fingerprints/SD258/images
+    minutiae_root: datasets/fingerprints/SD258/minutiae
+    templates_dir: datasets/fingerprints/SD258/templates/dmd
+
+  sd302:
+    images_dir:    datasets/fingerprints/SD302/images
+    minutiae_root: datasets/fingerprints/SD302/minutiae
+    templates_dir: datasets/fingerprints/SD302/templates/dmd
+
+  ts1k:
+    images_dir:    datasets/fingerprints/TS1k/images
+    minutiae_root: datasets/fingerprints/TS1k/minutiae
+    templates_dir: datasets/fingerprints/TS1k/templates/dmd
+
+  fvc02db1:
+    images_dir:    datasets/fingerprints/FVC/FVC02DB1/orig
+    minutiae_root: datasets/fingerprints/FVC/FVC02DB1/minutiae
+    templates_dir: datasets/fingerprints/FVC/FVC02DB1/templates/dmd
+
+  fvc04db1:
+    images_dir:    datasets/fingerprints/FVC/FVC04DB1/orig
+    minutiae_root: datasets/fingerprints/FVC/FVC04DB1/minutiae
+    templates_dir: datasets/fingerprints/FVC/FVC04DB1/templates/dmd
+
+extractors: [pyfing, fingernet, stitch, verifinger, innovatrics, mulay, minutiaenet]
+
+extraction:
+  min_quality: 0       # keep all minutiae by default
+  device: cuda
+  overwrite: false     # skip .pkl already on disk
+
+matching:
+  min_quality: 0       # filter minutiae at template-load time (no re-extraction needed)
+  device: cuda
+  batch_size: 256
+  threshold_targets: [0.0001, 0.001, 0.01]
+
+  combos:
+    # SD258 latent-vs-reference (sample-00 = latent, sample-01 = template)
+    - name: sd258-vs-sd258
+      queries: {dataset: sd258, regex: '.*-00-.*'}
+      gallery: {dataset: sd258, regex: '.*-01-.*'}
+
+    # SD302 latent-vs-reference (same convention)
+    - name: sd302-vs-sd302
+      queries: {dataset: sd302, regex: '.*-00-.*'}
+      gallery: {dataset: sd302, regex: '.*-01-.*'}
+
+    # FVC leave-one-out: every sample is queried against the other 7 of its finger
+    # (genuines) and against all samples of the other fingers (impostors).
+    - name: fvc02db1-loo
+      queries: {dataset: fvc02db1}
+      gallery: {dataset: fvc02db1}
+      genuine_mask_mode: fvc_loo
+
+    - name: fvc04db1-loo
+      queries: {dataset: fvc04db1}
+      gallery: {dataset: fvc04db1}
+      genuine_mask_mode: fvc_loo
+
+    # Future — add ts1k as distractor pool:
+    # - name: sd258-vs-sd258+ts1k
+    #   queries: {dataset: sd258, regex: '.*-00-.*'}
+    #   gallery: {dataset: sd258, regex: '.*-01-.*'}
+    #   distractors: [ts1k]

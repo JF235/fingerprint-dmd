@@ -55,7 +55,7 @@ def _collect_images(input_dir, filter_regex=None, filter_list=None):
     return files
 
 
-def load_min_file(min_path):
+def load_min_file(min_path, min_quality=0):
     """Load a .min minutiae file.
 
     .min format:
@@ -65,6 +65,10 @@ def load_min_file(min_path):
         - ANGLE: degrees, counterclockwise from +x axis, integer [0, 360)
         - QUALITY: integer 0-100
         - TYPE, EXTRA: optional, ignored
+
+    Args:
+        min_path:    path to .min file
+        min_quality: drop minutiae with quality < min_quality (default 0 = keep all)
 
     Returns:
         mnt_for_dmd:  (N, 3) float32 [x, y, angle_cw_degrees]  — for extractor.extract()
@@ -78,6 +82,8 @@ def load_min_file(min_path):
                 continue
             parts = line.split()
             x, y, angle, quality = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+            if quality < min_quality:
+                continue
             rows.append((x, y, angle, quality))
 
     if not rows:
@@ -141,62 +147,76 @@ def _parse_args(argv):
                         help="Text file with one relative path per line to include")
     parser.add_argument("--device",       default="cuda",
                         help="Torch device for inference (default: cuda)")
-    parser.add_argument("--batch-size",  type=int, default=1,
+    parser.add_argument("--batch-size",   type=int, default=1,
                         help="Number of images to process per batch (default: 1)")
-    parser.add_argument("--skip-existing", action="store_true",
-                        help="Skip images whose .pkl already exists (default: re-extract)")
+    parser.add_argument("--overwrite",    action="store_true",
+                        help="Re-extract even if .pkl already exists (default: skip)")
+    parser.add_argument("--min-quality",  type=int, default=0,
+                        help="Drop minutiae with quality < N before extraction (default: 0 = keep all)")
     return parser.parse_args(argv)
 
 
-def run(argv):
-    args   = _parse_args(argv)
-    device = args.device if torch.cuda.is_available() else "cpu"
+def extract_dataset(
+    extractor,
+    input_dir,
+    minutiae_dir,
+    output_dir,
+    *,
+    images=None,
+    filter_regex=None,
+    filter_list=None,
+    min_quality=0,
+    overwrite=False,
+    batch_size=1,
+    progress_desc="Extracting",
+):
+    """Extract DMD templates over a dataset using a pre-loaded extractor.
 
-    print(f"Loading DMD++ model (device={device})...")
-    extractor = dmd.DmdExtractor(model_path=dmd.get_model_path("dmd++"), device=device)
-
-    images = _collect_images(args.input_dir, args.filter_regex, args.filter_list)
-    print(f"Found {len(images)} images to process")
-
+    If `images` is provided (list of Paths), the filesystem walk is skipped.
+    `batch_size > 1` enables ``extractor.extract_batch`` for throughput; on
+    failure the batch is retried image-by-image so a single bad image does
+    not poison the whole batch. Returns dict with counts:
+    ``{processed, skipped, errors, total}``.
+    """
+    if images is None:
+        images = _collect_images(input_dir, filter_regex, filter_list)
     if not images:
-        print("No images found. Exiting.")
-        sys.exit(0)
+        print(f"No images found under {input_dir}")
+        return {"processed": 0, "skipped": 0, "errors": 0, "total": 0}
 
-    input_path    = Path(args.input_dir)
-    minutiae_path = Path(args.minutiae_dir)
-    output_path   = Path(args.output_dir)
+    input_path    = Path(input_dir)
+    minutiae_path = Path(minutiae_dir)
+    output_path   = Path(output_dir)
 
     skipped = errors = 0
-    batch_size = args.batch_size
 
-    # Filter images: skip already-extracted, load minutiae
+    # Filter images: skip already-extracted, verify .min present.
     work_items = []  # (img_path, rel_path, out_path, min_path)
     for img_path in images:
         rel_path = img_path.relative_to(input_path)
         out_path = output_path / rel_path.with_suffix(".pkl")
 
-        if args.skip_existing and out_path.exists():
+        if not overwrite and out_path.exists():
             skipped += 1
             continue
 
         min_path = minutiae_path / rel_path.with_suffix(".min")
         if not min_path.exists():
-            print(f"Warning: no .min file for {rel_path} (expected {min_path})")
+            tqdm.write(f"Warning: no .min file for {rel_path} (expected {min_path})")
             errors += 1
             continue
 
         work_items.append((img_path, rel_path, out_path, min_path))
 
-    print(f"To process: {len(work_items)}, Skipped (existing): {skipped}")
-
-    pbar = tqdm(total=len(work_items), desc="Extracting")
+    pbar = tqdm(total=len(work_items), desc=progress_desc)
+    meta = {"min_quality": min_quality}
 
     for batch_start in range(0, len(work_items), batch_size):
         batch = work_items[batch_start:batch_start + batch_size]
-        batch_imgs = []
-        batch_mnts_dmd = []
+        batch_imgs      = []
+        batch_mnts_dmd  = []
         batch_mnts_orig = []
-        batch_meta = []
+        batch_meta      = []  # list of (rel_path, out_path) parallel to batch_imgs
 
         for img_path, rel_path, out_path, min_path in batch:
             img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
@@ -206,11 +226,11 @@ def run(argv):
                 pbar.update(1)
                 continue
 
-            mnt_for_dmd, mnt_original = load_min_file(min_path)
+            mnt_for_dmd, mnt_original = load_min_file(min_path, min_quality=min_quality)
             batch_imgs.append(img)
             batch_mnts_dmd.append(mnt_for_dmd)
             batch_mnts_orig.append(mnt_original)
-            batch_meta.append(out_path)
+            batch_meta.append((rel_path, out_path))
 
         if not batch_imgs:
             continue
@@ -225,24 +245,52 @@ def run(argv):
         except Exception as e:
             tqdm.write(f"Batch failed ({e}); retrying images individually")
             templates = []
-            for img, mnt in zip(batch_imgs, batch_mnts_dmd):
+            for (rel_path, _out), img, mnt in zip(batch_meta, batch_imgs, batch_mnts_dmd):
                 try:
                     templates.append(extractor.extract(img, mnt))
                 except Exception as e2:
-                    tqdm.write(f"Error on image: {e2}")
+                    tqdm.write(f"Error on {rel_path}: {e2}")
                     templates.append(None)
 
-        for tmpl, mnt_orig, out_path in zip(templates, batch_mnts_orig, batch_meta):
+        for tmpl, mnt_orig, (rel_path, out_path) in zip(
+            templates, batch_mnts_orig, batch_meta,
+        ):
             if tmpl is None:
                 errors += 1
                 pbar.update(1)
                 continue
             result = _convert_template(tmpl, mnt_orig)
+            result["meta"] = meta
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "wb") as f:
                 pickle.dump(result, f)
             pbar.update(1)
 
     pbar.close()
-    processed = len(work_items) - errors
-    print(f"Done! Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
+    processed = len(images) - skipped - errors
+    return {"processed": processed, "skipped": skipped, "errors": errors, "total": len(images)}
+
+
+def run(argv):
+    args   = _parse_args(argv)
+    device = args.device if torch.cuda.is_available() else "cpu"
+
+    print(f"Loading DMD++ model (device={device})...")
+    extractor = dmd.DmdExtractor(model_path=dmd.get_model_path("dmd++"), device=device)
+
+    print(f"Scanning {args.input_dir}...")
+    counts = extract_dataset(
+        extractor,
+        args.input_dir,
+        args.minutiae_dir,
+        args.output_dir,
+        filter_regex=args.filter_regex,
+        filter_list=args.filter_list,
+        min_quality=args.min_quality,
+        overwrite=args.overwrite,
+        batch_size=args.batch_size,
+    )
+
+    if counts["total"] == 0:
+        sys.exit(0)
+    print(f"Done! Processed: {counts['processed']}, Skipped: {counts['skipped']}, Errors: {counts['errors']}")
