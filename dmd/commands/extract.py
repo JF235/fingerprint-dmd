@@ -7,7 +7,12 @@ Preserves the directory hierarchy from --input-dir into --output-dir.
 Output .pkl format per image:
     - minutiae:   np.ndarray (N, 4) int32   [x, y, angle_ccw_degrees, quality]
     - embeddings: np.ndarray (N, 768) float32
-    - mask:       np.ndarray (N, 768) float32  (foreground mask broadcast over 12 channels)
+    - mask:       np.ndarray (N, 64) float32  (raw foreground mask; the matcher
+                                                expands it ×12 internally to (N, 768))
+
+Note: older .pkl files in the wild use (N, 768) for the mask (repeat×12 of the
+raw 64-cell mask). Readers in this repo accept both — see
+``_pkl_to_dmd_template`` in match.py.
 """
 
 import argparse
@@ -30,6 +35,7 @@ _NDIM_FEAT    = 6
 _N_CHANNELS   = _NDIM_FEAT * 2                      # 12 (texture + minutiae)
 _SPATIAL_SIZE = 8                                    # 128 / (2^4 strides)
 _D_EMBEDDING  = _N_CHANNELS * _SPATIAL_SIZE ** 2    # 768
+_MASK_DIM     = _SPATIAL_SIZE ** 2                   # 64 (one mask cell per spatial position)
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +44,17 @@ _D_EMBEDDING  = _N_CHANNELS * _SPATIAL_SIZE ** 2    # 768
 
 def _collect_images(input_dir, filter_regex=None, filter_list=None):
     input_path = Path(input_dir)
-    files = sorted(f for f in input_path.rglob("*") if f.suffix.lower() in IMAGE_EXTENSIONS)
+    # Use os.walk(followlinks=True) so dataset trees with symlinks (e.g. FVCL400
+    # mirroring FVC) are traversed correctly. Path.rglob doesn't follow symlinks
+    # by default until Python 3.13.
+    import os
+    found = []
+    for root, dirs, fnames in os.walk(input_path, followlinks=True):
+        for fn in fnames:
+            p = Path(root) / fn
+            if p.suffix.lower() in IMAGE_EXTENSIONS:
+                found.append(p)
+    files = sorted(found)
 
     if filter_regex:
         pattern = re.compile(filter_regex)
@@ -105,8 +121,13 @@ def load_min_file(min_path, min_quality=0):
 def _convert_template(dmd_template, mnt_original):
     """Convert raw DMD output into the standard .pkl format.
 
-    Expands the foreground mask from (N, 64) to (N, 768) by repeating over
-    the 12 feature channels, matching what calculate_score_torchB expects.
+    Stores the raw (N, 64) foreground mask — one cell per 8×8 spatial
+    position. Earlier versions of this code persisted the mask pre-expanded
+    to (N, 768) (repeat×12 across feature channels) to save a multiplication
+    inside the matcher; that wasted ~190 KB per template on disk. The matcher
+    now expands the mask itself when it loads a template (see
+    ``_pkl_to_dmd_template`` in match.py), so we keep the compact form here
+    and the readers stay backwards-compatible with the old layout.
     """
     feature  = dmd_template["feature"].cpu().numpy()   # (N, 768)
     mask_raw = dmd_template["mask"].cpu().numpy()       # (N, 64)
@@ -116,13 +137,13 @@ def _convert_template(dmd_template, mnt_original):
         return {
             "minutiae":   np.empty((0, 4),            dtype=np.int32),
             "embeddings": np.empty((0, _D_EMBEDDING), dtype=np.float32),
-            "mask":       np.empty((0, _D_EMBEDDING), dtype=np.float32),
+            "mask":       np.empty((0, _MASK_DIM),    dtype=np.float32),
         }
 
     return {
         "minutiae":   mnt_original[:N].copy(),
         "embeddings": feature.astype(np.float32),
-        "mask":       np.repeat(mask_raw, _N_CHANNELS, axis=1).astype(np.float32),
+        "mask":       mask_raw.astype(np.float32),
     }
 
 

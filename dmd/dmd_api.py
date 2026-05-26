@@ -1,5 +1,5 @@
 import os
-from .dmd_utils import get_model, get_template, get_templates_batch, match, identify
+from .dmd_utils import get_model, get_template, get_templates_batch, match, identify, match_pairs
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -62,6 +62,16 @@ class DmdMatcher:
 
     def identify(self, queries, gallery, device='cpu', batch_size=256):
         return identify(queries, gallery, device, batch_size)
+
+    def match_pairs(self, queries, gallery, device='cuda', batch_size=64,
+                    return_details=False, progress=True):
+        """Score an explicit list of parallel (query_i, gallery_i) pairs.
+
+        Unlike ``identify`` (full Q×G), this scores exactly ``len(queries)``
+        pairs. See ``dmd.dmd_utils.match_pairs`` for full docstring.
+        """
+        return match_pairs(queries, gallery, device=device, batch_size=batch_size,
+                           return_details=return_details, progress=progress)
 
 def get_model_path(which="dmd++"):
     if which == "dmd++":

@@ -1,0 +1,3 @@
+# Pastas pesadas / com artefatos de treinamento — excluídas do contexto automático
+logs/
+models_paper/

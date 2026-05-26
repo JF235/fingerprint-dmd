@@ -35,7 +35,14 @@ import dmd
 def _collect_templates(root_dir, filter_regex=None, filter_list=None):
     """Return sorted list of .pkl paths under root_dir, with optional filters."""
     root  = Path(root_dir)
-    files = sorted(f for f in root.rglob("*.pkl"))
+    # os.walk(followlinks=True) handles symlinked subtrees (e.g. FVCL400 layout).
+    import os
+    found = []
+    for r, dirs, fnames in os.walk(root, followlinks=True):
+        for fn in fnames:
+            if fn.endswith(".pkl"):
+                found.append(Path(r) / fn)
+    files = sorted(found)
 
     if filter_regex:
         pattern = re.compile(filter_regex)
@@ -52,15 +59,30 @@ def _collect_templates(root_dir, filter_regex=None, filter_list=None):
     return files
 
 
-def _identity_key(pkl_path, root_dir):
+def _identity_key(pkl_path, root_dir, identity_regex=None):
     """Return (dataset_alias, subject_id) for a template path.
 
     dataset_alias = first '_'-delimited token of the filename stem
-    subject_id    = level-1 subdirectory name relative to root_dir
+    subject_id    = level-1 subdirectory name relative to root_dir, OR
+                    capture group 1 of `identity_regex` matched against the
+                    relative path (when set). The regex form is required for
+                    datasets like SD302 where the pasta hierarchy does not
+                    preserve finger identity (multiple subject_id folders may
+                    point to the same physical finger; identity is encoded in
+                    the filename instead).
     """
     rel = pkl_path.relative_to(root_dir)
-    subject_id    = rel.parts[0]
     dataset_alias = pkl_path.stem.split("_")[0]
+    if identity_regex is not None:
+        m = identity_regex.search(str(rel))
+        if m is None or not m.groups():
+            raise ValueError(
+                f"identity_regex {identity_regex.pattern!r} did not match {rel!r} "
+                "(expected group 1 = identity)"
+            )
+        subject_id = m.group(1)
+    else:
+        subject_id = rel.parts[0]
     return (dataset_alias, subject_id)
 
 
@@ -73,7 +95,8 @@ def _pkl_to_dmd_template(data, min_quality=0):
 
     .pkl stores:
         embeddings (N, 768) — flat features
-        mask       (N, 768) — expanded mask (repeat×12); recover with [:, ::12]
+        mask       (N, 64)  — raw foreground mask (current format), OR
+                   (N, 768) — repeat×12 of the (N, 64) mask (legacy format)
         minutiae   (N, 4)   — [x, y, angle_ccw, quality] in .min convention
 
     Args:
@@ -95,8 +118,14 @@ def _pkl_to_dmd_template(data, min_quality=0):
         mask_arr   = mask_arr[keep]
         minutiae   = minutiae[keep]
 
+    # Recover the raw (N, 64) mask. Legacy .pkl files persist it expanded to
+    # (N, 768) via np.repeat(...×12) — take every 12th column. New files
+    # already store the (N, 64) form.
+    if mask_arr.ndim == 2 and mask_arr.shape[1] == 768:
+        mask_arr = mask_arr[:, ::12]
+
     feature = torch.from_numpy(embeddings).float()              # (N, 768)
-    mask    = torch.from_numpy(mask_arr[:, ::12]).float()       # (N, 64)
+    mask    = torch.from_numpy(mask_arr).float()                # (N, 64)
 
     minutiae  = minutiae.astype(np.float32)                     # (N, 4)
     angle_cw  = (360.0 - minutiae[:, 2]) % 360.0                # CCW → CW
@@ -249,12 +278,30 @@ def _load_custom_genuine_csv(csv_path, query_paths, gallery_paths, query_root, g
 def _parse_args(argv):
     p = argparse.ArgumentParser(
         prog="dmd match",
-        description="Run DMD identification / verification experiment.",
+        description="Run DMD identification / verification experiment, or score "
+                    "an explicit pair list (--pairs-list).",
     )
-    p.add_argument("--queries-dir",   required=True,
-                   help="Root directory of query templates (.pkl)")
-    p.add_argument("--gallery-dir",   required=True,
-                   help="Root directory of gallery templates (.pkl)")
+    p.add_argument("--queries-dir",   default=None,
+                   help="Root directory of query templates (.pkl). Required unless --pairs-list is set.")
+    p.add_argument("--gallery-dir",   default=None,
+                   help="Root directory of gallery templates (.pkl). Required unless --pairs-list is set.")
+    p.add_argument("--pairs-list",    default=None,
+                   help="CSV with explicit pairs to score (columns: query_path, gallery_path "
+                        "[, label]). Paths are resolved against --templates-dir (or --queries-dir "
+                        "if --templates-dir is omitted). When set, only those pairs are scored; "
+                        "no Q×G matrix, no CMC/ROC are computed.")
+    p.add_argument("--templates-dir", default=None,
+                   help="Single root for resolving paths in --pairs-list. Defaults to --queries-dir.")
+    p.add_argument("--save-pair-details", action="store_true",
+                   help="In --pairs-list mode, also dump LSAR minutia correspondences per pair "
+                        "to pair_details.pkl alongside pair_scores.csv.")
+    p.add_argument("--match-files-dir", default=None,
+                   help="In --pairs-list mode, write one self-contained .match text file per "
+                        "pair under this directory (mirrors query path hierarchy, .pkl→.match). "
+                        "Format: #MATCH SCORE/LABEL header lines, then "
+                        "'#MMIN SCORE X1 Y1 THETA1 Q1 X2 Y2 THETA2 Q2' column row, then "
+                        "one row per LSAR-selected minutia correspondence with the resolved "
+                        "minutia values from both templates (CCW angles, .min convention).")
     p.add_argument("--query-regex",   default=None,
                    help="Regex filter applied to query relative paths")
     p.add_argument("--query-list",    default=None,
@@ -283,6 +330,10 @@ def _parse_args(argv):
                    help="CSV with columns (query_rel_path, gallery_rel_path, is_genuine); used when --genuine-mask-mode=custom_csv")
     p.add_argument("--threshold-targets", default="0.0001,0.001,0.01",
                    help="Comma-separated FAR targets for threshold reporting (default: 0.0001,0.001,0.01)")
+    p.add_argument("--identity-regex", default=None,
+                   help="Regex with group 1 = identity, applied to relative path to derive subject_id "
+                        "(replaces default of using level-1 directory). Useful for SD302 where pasta does not "
+                        r"preserve finger identity (e.g. 'sd302_(\\d+_\\d+)[-_]')")
     return p.parse_args(argv)
 
 
@@ -314,6 +365,7 @@ def match_dataset(
     genuine_mask_mode="auto",
     genuine_mask_csv=None,
     threshold_targets=(0.0001, 0.001, 0.01),
+    identity_regex=None,
 ):
     """Run an identification/verification experiment programmatically.
 
@@ -373,9 +425,10 @@ def match_dataset(
         more = f" ... and {len(overlap) - 10} more" if len(overlap) > 10 else ""
         raise MatchError(f"{len(overlap)} file(s) appear in both queries and gallery: {sample}{more}")
 
-    query_keys   = [_identity_key(f, query_root) for f in query_files]
+    id_re = re.compile(identity_regex) if identity_regex else None
+    query_keys   = [_identity_key(f, query_root, id_re) for f in query_files]
     gallery_keys = [
-        _identity_key(f, root)
+        _identity_key(f, root, id_re)
         for f, root in zip(all_gallery_paths, all_gallery_roots)
     ]
 
@@ -533,8 +586,218 @@ def match_dataset(
     return metrics
 
 
+def _write_match_file(path, *, score, label, q_rel, g_rel,
+                      lambdas, q_mnt_rows, g_mnt_rows):
+    """Write one self-contained .match file (text, .min-style header convention).
+
+    Columns: SCORE X1 Y1 THETA1 Q1 X2 Y2 THETA2 Q2
+        - SCORE: per-correspondence relaxed score (lambda)
+        - X*, Y*: pixel coords (origin top-left)
+        - THETA*: minutia angle in degrees, CCW from +x, integer [0, 360)
+        - Q*: minutia quality (integer 0-100)
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(f"#MATCH SCORE {score:.6f}\n")
+        fh.write(f"#MATCH LABEL {label if label is not None else ''}\n")
+        fh.write(f"#MATCH Q {q_rel}\n")
+        fh.write(f"#MATCH G {g_rel}\n")
+        fh.write("#MMIN SCORE X1 Y1 THETA1 Q1 X2 Y2 THETA2 Q2\n")
+        for lam, qm, gm in zip(lambdas, q_mnt_rows, g_mnt_rows):
+            fh.write(
+                f"{float(lam):.6f} "
+                f"{int(qm[0])} {int(qm[1])} {int(qm[2])} {int(qm[3])} "
+                f"{int(gm[0])} {int(gm[1])} {int(gm[2])} {int(gm[3])}\n"
+            )
+
+
+def match_pair_list(
+    pairs_csv,
+    output_dir,
+    *,
+    templates_dir,
+    device="cuda",
+    batch_size=64,
+    min_quality=0,
+    save_pair_details=False,
+    match_files_dir=None,
+):
+    """Score an explicit list of (query, gallery) pairs from a CSV.
+
+    Input CSV format (header required):
+        query_path,gallery_path[,label]
+    Paths are interpreted relative to ``templates_dir``. The optional ``label``
+    column is passed through to the output unchanged (typical use: 0/1 for
+    impostor/genuine, or a finger-id).
+
+    Outputs (in ``output_dir``):
+        pair_scores.csv : query_path, gallery_path, score, label (if present)
+        pair_details.pkl : list of {pairs, lambda, n_pair} aligned with the CSV,
+                           only when ``save_pair_details=True``.
+    """
+    device = device if torch.cuda.is_available() else "cpu"
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    root = Path(templates_dir)
+
+    print(f"Loading pair list from {pairs_csv}")
+    rows = []
+    with open(pairs_csv) as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        if header is None:
+            raise MatchError(f"pairs CSV {pairs_csv} is empty")
+        has_label = len(header) >= 3
+        for row in reader:
+            if not row or len(row) < 2:
+                continue
+            q, g = row[0].strip(), row[1].strip()
+            label = row[2].strip() if has_label and len(row) >= 3 else None
+            rows.append((q, g, label))
+    if not rows:
+        raise MatchError(f"pairs CSV {pairs_csv} has no data rows")
+    print(f"  {len(rows)} pairs")
+
+    need_details = save_pair_details or (match_files_dir is not None)
+    need_raw_mnt = match_files_dir is not None
+
+    print(f"Loading templates from {root} (min_quality={min_quality})...")
+    cache = {}
+    raw_mnt_cache = {} if need_raw_mnt else None
+    def _get(rel_path):
+        if rel_path not in cache:
+            full = root / rel_path
+            if not full.exists():
+                raise MatchError(f"template not found: {full}")
+            cache[rel_path] = _load_template(full, min_quality=min_quality)
+            if need_raw_mnt:
+                # Raw minutiae (N,4) [x, y, angle_ccw, quality] in .min convention,
+                # exactly as stored by extract.py — used to render the .match files.
+                with open(full, "rb") as fh:
+                    data = pickle.load(fh)
+                mnt = np.asarray(data["minutiae"])
+                if min_quality > 0 and len(mnt) > 0:
+                    mnt = mnt[mnt[:, 3] >= min_quality]
+                raw_mnt_cache[rel_path] = mnt
+        return cache[rel_path]
+
+    # Pre-load every distinct path so the matching loop is purely GPU-bound.
+    unique_paths = sorted({p for r in rows for p in (r[0], r[1])})
+    for rel in tqdm(unique_paths, desc="  templates"):
+        _get(rel)
+    print(f"  loaded {len(unique_paths)} unique templates "
+          f"({len(rows) * 2 - len(unique_paths)} reuses)")
+
+    queries  = [_get(q) for q, _, _ in rows]
+    gallery  = [_get(g) for _, g, _ in rows]
+
+    print(f"Scoring {len(rows)} pairs on {device} (batch_size={batch_size})...")
+    matcher = dmd.DmdMatcher()
+    if need_details:
+        scores, details = matcher.match_pairs(
+            queries, gallery, device=device, batch_size=batch_size,
+            return_details=True, progress=True,
+        )
+    else:
+        scores = matcher.match_pairs(
+            queries, gallery, device=device, batch_size=batch_size,
+            return_details=False, progress=True,
+        )
+        details = None
+
+    scores_path = out / "pair_scores.csv"
+    with open(scores_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        if has_label:
+            w.writerow(["query_path", "gallery_path", "score", "label"])
+        else:
+            w.writerow(["query_path", "gallery_path", "score"])
+        for (q, g, label), s in zip(rows, scores):
+            score_str = "" if np.isnan(s) else f"{float(s):.6f}"
+            if has_label:
+                w.writerow([q, g, score_str, label if label is not None else ""])
+            else:
+                w.writerow([q, g, score_str])
+    print(f"  scores -> {scores_path}")
+
+    if save_pair_details:
+        details_path = out / "pair_details.pkl"
+        with open(details_path, "wb") as fh:
+            pickle.dump({
+                "rows":    [{"query_path": q, "gallery_path": g, "label": label}
+                            for q, g, label in rows],
+                "details": details,
+            }, fh)
+        print(f"  details -> {details_path}")
+
+    if match_files_dir is not None:
+        match_root = Path(match_files_dir)
+        match_root.mkdir(parents=True, exist_ok=True)
+        n_written = 0
+        for (q_rel, g_rel, label), s, det in tqdm(
+            zip(rows, scores, details), total=len(rows), desc="  match files",
+        ):
+            if np.isnan(s):
+                continue
+            q_mnt = raw_mnt_cache[q_rel]
+            g_mnt = raw_mnt_cache[g_rel]
+            pairs_arr = det["pairs"]
+            if len(pairs_arr) == 0:
+                # Still write an empty file so consumers can rely on its existence.
+                q_rows = np.empty((0, 4), dtype=np.int64)
+                g_rows = np.empty((0, 4), dtype=np.int64)
+            else:
+                q_rows = q_mnt[pairs_arr[:, 0]]
+                g_rows = g_mnt[pairs_arr[:, 1]]
+            # .match path mirrors the query path under match_files_dir (.pkl→.match).
+            out_path = match_root / q_rel
+            out_path = out_path.with_suffix(".match")
+            _write_match_file(
+                out_path,
+                score=float(s),
+                label=label,
+                q_rel=q_rel,
+                g_rel=g_rel,
+                lambdas=det["lambda"],
+                q_mnt_rows=q_rows,
+                g_mnt_rows=g_rows,
+            )
+            n_written += 1
+        print(f"  match files -> {match_root}  ({n_written} files)")
+
+    n_valid = int(np.sum(~np.isnan(scores)))
+    print(f"Done: {n_valid}/{len(rows)} pairs scored "
+          f"(mean={np.nanmean(scores):.4f}, std={np.nanstd(scores):.4f})")
+    return {"n_pairs": len(rows), "n_valid": n_valid}
+
+
 def run(argv):
     args = _parse_args(argv)
+
+    # Pair-list mode short-circuits the full identification pipeline.
+    if args.pairs_list:
+        templates_dir = args.templates_dir or args.queries_dir
+        if not templates_dir:
+            print("Error: --pairs-list requires --templates-dir (or --queries-dir as fallback)")
+            sys.exit(1)
+        try:
+            match_pair_list(
+                args.pairs_list, args.output_dir,
+                templates_dir=templates_dir,
+                device=args.device, batch_size=args.batch_size,
+                min_quality=args.min_quality,
+                save_pair_details=args.save_pair_details,
+                match_files_dir=args.match_files_dir,
+            )
+        except MatchError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        return
+
+    if not args.queries_dir or not args.gallery_dir:
+        print("Error: --queries-dir and --gallery-dir are required for identification mode")
+        sys.exit(1)
+
     threshold_targets = tuple(float(x) for x in args.threshold_targets.split(",") if x.strip())
     try:
         match_dataset(
@@ -547,6 +810,7 @@ def run(argv):
             genuine_mask_mode=args.genuine_mask_mode,
             genuine_mask_csv=args.genuine_mask_csv,
             threshold_targets=threshold_targets,
+            identity_regex=args.identity_regex,
         )
     except MatchError as e:
         print(f"Error: {e}")

@@ -724,3 +724,143 @@ def identify(query_templates:list[dict], gallery_templates:list[dict], device:st
         scores_matrix[q_indices, g_indices] = final_scores.cpu().numpy()
 
     return scores_matrix
+
+
+def match_pairs(query_templates, gallery_templates, device='cuda', batch_size=64,
+                return_details=False, progress=True):
+    """Score N parallel (query_i, gallery_i) template pairs in batched fashion.
+
+    Unlike ``identify``, which computes a full Q×G matrix, this function evaluates
+    exactly ``len(query_templates)`` pairs: pair *i* is
+    ``(query_templates[i], gallery_templates[i])``.
+
+    Args:
+        query_templates:   list of N query template dicts (feature, mask, mnt)
+        gallery_templates: list of N gallery template dicts (same length as queries)
+        device:            torch device for batched scoring
+        batch_size:        number of pairs scored per forward pass
+        return_details:    if True, also returns per-pair LSAR minutia correspondences
+        progress:          show a tqdm progress bar over batches
+
+    Returns:
+        scores: np.ndarray of shape (N,) float32 — DMD score per pair (NaN if any
+                template in the pair had zero minutiae).
+        If return_details=True, also returns:
+            details: list of length N. details[i] is a dict with keys:
+                'pairs'        : (k, 2) int64 — selected minutia index pairs
+                                 (query_minutia_idx, gallery_minutia_idx) from LSAR
+                'lambda'       : (k,) float32 — post-relaxation scores for each pair
+                'n_pair'       : int — number of selected pairs (== len(pairs))
+                Indices that fall on padded slots are filtered out so every entry
+                points to a real minutia in the original (un-padded) template.
+    """
+    assert len(query_templates) == len(gallery_templates), \
+        "query_templates and gallery_templates must have equal length"
+    N = len(query_templates)
+    if N == 0:
+        empty = np.zeros((0,), dtype=np.float32)
+        return (empty, []) if return_details else empty
+
+    device = torch.device(device)
+    # Mirror identify(): move templates to CPU so we control device transfers.
+    q_tpls = [{k: v.cpu() for k, v in t.items()} for t in query_templates]
+    g_tpls = [{k: v.cpu() for k, v in t.items()} for t in gallery_templates]
+
+    feat_dim = q_tpls[0]['feature'].shape[-1]
+    mask_dim = q_tpls[0]['mask'].shape[-1]
+
+    all_scores = np.full(N, np.nan, dtype=np.float32)
+    all_details = [] if return_details else None
+
+    iterator = range(0, N, batch_size)
+    if progress:
+        iterator = tqdm(iterator, total=(N + batch_size - 1) // batch_size, desc="match_pairs")
+
+    for b0 in iterator:
+        b1 = min(b0 + batch_size, N)
+        qs = q_tpls[b0:b1]
+        gs = g_tpls[b0:b1]
+        B = len(qs)
+
+        nq_list = [t['feature'].shape[0] for t in qs]
+        ng_list = [t['feature'].shape[0] for t in gs]
+        max_Nq = max(nq_list)
+        max_Ng = max(ng_list)
+
+        # Any pair with an empty template gets NaN score; LSAR shortcut would
+        # need to be called with at least 1 mnt per side, so we skip those rows.
+        valid_rows = [i for i in range(B) if nq_list[i] > 0 and ng_list[i] > 0]
+        if not valid_rows:
+            continue
+
+        Bv = len(valid_rows)
+        # NaN-padded tensors: lsar_score_torchB detects per-row mnt counts via
+        # ``torch.sum(~torch.isnan(S[:, :, 0]), dim=-1)`` so NaN is meaningful.
+        q_feat = torch.full((Bv, max_Nq, feat_dim), float('nan'), dtype=torch.float32)
+        q_mask = torch.full((Bv, max_Nq, mask_dim), float('nan'), dtype=torch.float32)
+        q_mnt  = torch.full((Bv, max_Nq, 3),        float('nan'), dtype=torch.float32)
+        g_feat = torch.full((Bv, max_Ng, feat_dim), float('nan'), dtype=torch.float32)
+        g_mask = torch.full((Bv, max_Ng, mask_dim), float('nan'), dtype=torch.float32)
+        g_mnt  = torch.full((Bv, max_Ng, 3),        float('nan'), dtype=torch.float32)
+
+        for vi, src_i in enumerate(valid_rows):
+            qt = qs[src_i]
+            gt = gs[src_i]
+            nq, ng = nq_list[src_i], ng_list[src_i]
+            q_feat[vi, :nq] = qt['feature']
+            q_mask[vi, :nq] = qt['mask']
+            # mnt is stored as (1, N, 3); squeeze the leading batch dim.
+            q_mnt[vi, :nq] = qt['mnt'].squeeze(0)[:nq]
+            g_feat[vi, :ng] = gt['feature']
+            g_mask[vi, :ng] = gt['mask']
+            g_mnt[vi, :ng] = gt['mnt'].squeeze(0)[:ng]
+
+        q_feat = q_feat.to(device, non_blocking=True)
+        q_mask = q_mask.to(device, non_blocking=True)
+        q_mnt  = q_mnt.to(device,  non_blocking=True)
+        g_feat = g_feat.to(device, non_blocking=True)
+        g_mask = g_mask.to(device, non_blocking=True)
+        g_mnt  = g_mnt.to(device,  non_blocking=True)
+
+        with torch.no_grad():
+            S = calculate_score_torchB(
+                q_feat, g_feat, q_mask, g_mask,
+                ndim_feat=12, Normalize=True, N_mean=1327,
+            )
+            final_score, pairs, _scores, relaxed, sorted_idx, n_pair = \
+                lsar_score_torchB(S, q_mnt, g_mnt)
+
+        final_np   = final_score.cpu().numpy()
+        for vi, src_i in enumerate(valid_rows):
+            all_scores[b0 + src_i] = final_np[vi]
+
+        if return_details:
+            pairs_np   = pairs.cpu().numpy()      # (Bv, max_n_pair_candidates, 2)
+            relaxed_np = relaxed.cpu().numpy()    # (Bv, max_n_pair_candidates)
+            sorted_np  = sorted_idx.cpu().numpy() # (Bv, max_n_pair_candidates)
+            n_pair_np  = n_pair.cpu().numpy()     # (Bv,)
+            # Sparse, per-batch fill so all_details[i] aligns with input index.
+            slot_by_idx = {b0 + src_i: vi for vi, src_i in enumerate(valid_rows)}
+            for i in range(b0, b1):
+                vi = slot_by_idx.get(i)
+                if vi is None:
+                    all_details.append({'pairs': np.empty((0, 2), dtype=np.int64),
+                                        'lambda': np.empty((0,), dtype=np.float32),
+                                        'n_pair': 0})
+                    continue
+                k = int(n_pair_np[vi])
+                top = sorted_np[vi, :k]
+                p = pairs_np[vi, top]               # (k, 2): (q_idx, g_idx)
+                lam = relaxed_np[vi, top]
+                # Filter correspondences pointing into the NaN-padded region.
+                src_nq, src_ng = nq_list[i - b0], ng_list[i - b0]
+                valid = (p[:, 0] < src_nq) & (p[:, 1] < src_ng)
+                all_details.append({
+                    'pairs': p[valid].astype(np.int64),
+                    'lambda': lam[valid].astype(np.float32),
+                    'n_pair': int(valid.sum()),
+                })
+
+    if return_details:
+        return all_scores, all_details
+    return all_scores
